@@ -62,7 +62,7 @@ def iniciar_auto_click():
             executando = False
             return
 
-        label_status.configure(text="Status: Executando Auto-Clicker", text_color="#00FF008D")
+        label_status.configure(text="Status: Executando Auto-Clicker", text_color="#127812")
 
         def loop_click():
             global contador
@@ -125,7 +125,7 @@ def executar_macro():
     contador = 0
     atualizar_contador()
     delay_factor = float(velocidade_slider.get())
-    label_status.configure(text="Status: Executando Macro", text_color="#00FF008D")
+    label_status.configure(text="Status: Executando Macro", text_color="#127812")
 
     def loop_macro():
         global contador
