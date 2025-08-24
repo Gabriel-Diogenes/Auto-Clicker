@@ -4,19 +4,20 @@ import time
 import json
 from pynput.keyboard import Controller, Listener, Key
 
-# Inicializa tema
+# === Configurações iniciais ===
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-# Controlador do teclado
 keyboard = Controller()
 
-# Variáveis globais
+# === Variáveis globais ===
 executando = False
-thread_autoclick = None
+gravando = False
+macro_gravado = []
 contador = 0
+thread_execucao = None
+CONFIG_FILE = "macro_dashboard_moderno.json"
 
-# Dicionário de teclas especiais
+# Teclas especiais
 teclas_especiais = {
     "Espaço": Key.space,
     "Enter": Key.enter,
@@ -28,189 +29,289 @@ teclas_especiais = {
     "Esc": Key.esc
 }
 
-CONFIG_FILE = "config_autoclicker.json"
+# === Funções de atualização ===
+def atualizar_contador():
+    label_contador.configure(text=f"Repetições executadas: {contador}")
 
-# ===== FUNÇÕES =====
-def iniciar():
-    global executando, thread_autoclick, contador
+def atualizar_lista_macro():
+    listbox_macros.delete("0.0", ctk.END)
+    for i, (t, a, d) in enumerate(macro_gravado):
+        listbox_macros.insert(ctk.END, f"{i+1}: {t} - {a} - {d:.2f}s\n")
+
+# === Auto Clicker ===
+def iniciar_auto_click():
+    global executando, thread_execucao, contador
     if not executando:
         executando = True
         contador = 0
         atualizar_contador()
-        thread_autoclick = threading.Thread(target=auto_click)
-        thread_autoclick.daemon = True
-        thread_autoclick.start()
+        delay = float(velocidade_slider.get())
+
+        teclas_selecionadas = []
+
+        # Teclas normais
+        entrada = entry_tecla.get()  # ex: "wasd"
+        for char in entrada:
+            teclas_selecionadas.append(char)
+
+        # Teclas especiais
+        for tecla, var in checkboxes_especiais.items():
+            if var.get():
+                teclas_selecionadas.append(teclas_especiais[tecla])
+
+        if not teclas_selecionadas:
+            label_status.configure(text="Status: Nenhuma tecla selecionada", text_color="#FF0000")
+            executando = False
+            return
+
+        label_status.configure(text="Status: Executando Auto-Clicker", text_color="#00FF00")
+
+        def loop_click():
+            global contador
+            if modo_infinito.get():
+                while executando:
+                    for t in teclas_selecionadas:
+                        keyboard.press(t)
+                    for t in reversed(teclas_selecionadas):
+                        keyboard.release(t)
+                    contador += 1
+                    atualizar_contador()
+                    time.sleep(delay)
+            else:
+                try:
+                    repeticoes = int(entry_repeticoes.get())
+                except:
+                    repeticoes = 1
+                for _ in range(repeticoes):
+                    if not executando:
+                        break
+                    for t in teclas_selecionadas:
+                        keyboard.press(t)
+                    for t in reversed(teclas_selecionadas):
+                        keyboard.release(t)
+                    contador += 1
+                    atualizar_contador()
+                    time.sleep(delay)
+
+            label_status.configure(text="Status: Pronto", text_color="white")
+
+        thread_execucao = threading.Thread(target=loop_click, daemon=True)
+        thread_execucao.start()
 
 def parar():
-    global executando
+    global executando, gravando
     executando = False
+    gravando = False
+    label_status.configure(text="Status: Parado", text_color="white")
 
-def atualizar_contador():
-    label_contador.configure(text=f"Repetições executadas: {contador}")
-    if executando:
-        app.after(100, atualizar_contador)
+# === Macro Recorder ===
+def iniciar_gravacao():
+    global gravando, macro_gravado
+    macro_gravado = []
+    gravando = True
+    label_status.configure(text="Status: Gravando Macro", text_color="#800080")
+    atualizar_lista_macro()
 
-def auto_click():
+def parar_gravacao():
+    global gravando
+    gravando = False
+    label_status.configure(text="Status: Macro Gravada", text_color="#800080")
+
+def executar_macro():
     global executando, contador
-    delay = velocidade_slider.get()
-
-    # Construir lista de teclas selecionadas
-    teclas_selecionadas = []
-
-    # Teclas normais
-    normal = entry_tecla.get()
-    if normal:
-        teclas_selecionadas.append(normal)
-
-    # Teclas especiais
-    for tecla, var in checkboxes_especiais.items():
-        if var.get():
-            teclas_selecionadas.append(teclas_especiais[tecla])
-
-    if not teclas_selecionadas:
+    if not macro_gravado:
+        label_status.configure(text="Status: Nenhuma macro gravada", text_color="#FF0000")
         return
 
-    # Modo infinito ou limitado
-    if modo_infinito.get():
-        while executando:
-            for t in teclas_selecionadas:
-                keyboard.press(t)
-            for t in reversed(teclas_selecionadas):
-                keyboard.release(t)
-            contador += 1
-            time.sleep(delay)
-    else:
-        try:
-            repeticoes = int(entry_repeticoes.get())
-        except ValueError:
-            repeticoes = 1
-        for _ in range(repeticoes):
-            if not executando:
-                break
-            for t in teclas_selecionadas:
-                keyboard.press(t)
-            for t in reversed(teclas_selecionadas):
-                keyboard.release(t)
-            contador += 1
-            time.sleep(delay)
-        parar()
+    executando = True
+    contador = 0
+    atualizar_contador()
+    delay_factor = float(velocidade_slider.get())
+    label_status.configure(text="Status: Executando Macro", text_color="#00FF00")
 
-# Atalhos globais
-def on_press(key):
+    def loop_macro():
+        global contador
+        if modo_infinito.get():
+            while executando:
+                for tecla, acao, tempo in macro_gravado:
+                    if not executando:
+                        break
+                    time.sleep(tempo * delay_factor)
+                    if acao == "press":
+                        keyboard.press(tecla)
+                    elif acao == "release":
+                        keyboard.release(tecla)
+                contador += 1
+                atualizar_contador()
+        else:
+            try:
+                repeticoes = int(entry_repeticoes.get())
+            except:
+                repeticoes = 1
+            for _ in range(repeticoes):
+                if not executando:
+                    break
+                for tecla, acao, tempo in macro_gravado:
+                    if not executando:
+                        break
+                    time.sleep(tempo * delay_factor)
+                    if acao == "press":
+                        keyboard.press(tecla)
+                    elif acao == "release":
+                        keyboard.release(tecla)
+                contador += 1
+                atualizar_contador()
+
+        label_status.configure(text="Status: Pronto", text_color="white")
+
+    threading.Thread(target=loop_macro, daemon=True).start()
+
+# Captura de teclas para macro
+def on_press_macro(key):
+    global gravando
+    if gravando:
+        macro_gravado.append((key, "press", 0.05))
+        atualizar_lista_macro()
+
+def on_release_macro(key):
+    global gravando
+    if gravando:
+        macro_gravado.append((key, "release", 0.05))
+        atualizar_lista_macro()
+
+# Listener global
+def on_press_global(key):
     try:
         if key == Key.f6:
-            iniciar()
+            threading.Thread(target=iniciar_auto_click, daemon=True).start()
         elif key == Key.f7:
+            parar()
+        elif key == Key.f8:  # F8 inicia a execução da macro
+            threading.Thread(target=executar_macro, daemon=True).start()
+        elif key == Key.f9:  # F9 para a execução da macro
             parar()
     except AttributeError:
         pass
 
-listener = Listener(on_press=on_press)
+listener = Listener(on_press=lambda k: [on_press_macro(k), on_press_global(k)],
+                    on_release=on_release_macro)
 listener.daemon = True
 listener.start()
 
-# Funções de configuração
+# === Salvar / Carregar Configuração ===
 def salvar_config():
     config = {
         "tecla_normal": entry_tecla.get(),
         "teclas_especiais": {k: var.get() for k, var in checkboxes_especiais.items()},
-        "velocidade": velocidade_slider.get(),
+        "velocidade": float(velocidade_slider.get()),
         "modo_infinito": modo_infinito.get(),
-        "repeticoes": entry_repeticoes.get()
+        "repeticoes": entry_repeticoes.get(),
+        "macro": [(str(k), a, d) for k, a, d in macro_gravado]
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f)
+    label_status.configure(text="Status: Configuração salva!", text_color="#1E90FF")
 
 def carregar_config():
     try:
         with open(CONFIG_FILE, "r") as f:
             config = json.load(f)
         entry_tecla.delete(0, ctk.END)
-        entry_tecla.insert(0, config.get("tecla_normal", ""))
+        entry_tecla.insert(0, config.get("tecla_normal",""))
         for k, v in config.get("teclas_especiais", {}).items():
             if k in checkboxes_especiais:
                 checkboxes_especiais[k].set(v)
-        velocidade_slider.set(config.get("velocidade", 0.5))
+        velocidade_slider.set(config.get("velocidade",0.5))
         modo_infinito.set(config.get("modo_infinito", True))
         entry_repeticoes.delete(0, ctk.END)
-        entry_repeticoes.insert(0, config.get("repeticoes", ""))
-        atualizar_valor(velocidade_slider.get())
+        entry_repeticoes.insert(0, config.get("repeticoes",""))
+        global macro_gravado
+        macro_gravado = []
+        for k, a, d in config.get("macro", []):
+            key_obj = getattr(Key, k.split(".")[-1]) if "Key." in k else k
+            macro_gravado.append((key_obj, a, d))
+        atualizar_lista_macro()
+        label_status.configure(text="Status: Configuração carregada", text_color="#1E90FF")
     except FileNotFoundError:
-        pass
+        label_status.configure(text="Status: Nenhum arquivo encontrado", text_color="#FF0000")
 
-# ===== INTERFACE =====
+# === Interface Moderna ===
 app = ctk.CTk()
-app.title("Auto Clicker Profissional - Multi-Teclas")
-app.geometry("600x600")
+app.title("Auto Clicker + Macro Dashboard Profissional")
+app.geometry("750x750")
 
-# Título
-titulo = ctk.CTkLabel(app, text="Auto Clicker Foda", font=("Arial", 22, "bold"))
+titulo = ctk.CTkLabel(app, text="🚀 Auto Clicker Macro Dashboard", font=("Arial", 22, "bold"))
 titulo.pack(pady=10)
 
-# Instruções
-instrucao = ctk.CTkLabel(app, 
-    text="Instruções:\n1. Digite teclas normais OU selecione múltiplas teclas especiais (Shift, Ctrl, etc.).\n2. Use o slider para definir a velocidade.\n3. Modo infinito ou repetições definidas.\n4. Atalhos globais: F6 → Iniciar | F7 → Parar\n5. Você pode salvar e carregar suas configurações.",
-    justify="center"
-)
-instrucao.pack(pady=10)
+# --- Painel Auto Clicker ---
+frame_autoclick = ctk.CTkFrame(app, fg_color="#2E8B57")
+frame_autoclick.pack(pady=5, padx=10, fill="x")
+ctk.CTkLabel(frame_autoclick, text="Auto Clicker", font=("Arial", 16, "bold")).pack(pady=5)
 
-# Entrada de tecla normal
-label_tecla = ctk.CTkLabel(app, text="Digite teclas normais:")
-label_tecla.pack(pady=5)
-entry_tecla = ctk.CTkEntry(app)
-entry_tecla.pack(pady=5)
+ctk.CTkLabel(frame_autoclick, text="Digite teclas normais:").pack(pady=2)
+entry_tecla = ctk.CTkEntry(frame_autoclick)
+entry_tecla.pack(pady=2)
 
-# Teclas especiais com checkboxes
-label_especial = ctk.CTkLabel(app, text="Selecione teclas especiais:")
-label_especial.pack(pady=5)
+ctk.CTkLabel(frame_autoclick, text="Selecione teclas especiais:").pack(pady=2)
+frame_check = ctk.CTkFrame(frame_autoclick)
+frame_check.pack(pady=2)
 checkboxes_especiais = {}
-frame_check = ctk.CTkFrame(app)
-frame_check.pack(pady=5)
 for tecla in teclas_especiais.keys():
     var = ctk.BooleanVar(value=False)
     chk = ctk.CTkCheckBox(frame_check, text=tecla, variable=var)
     chk.pack(anchor="w")
     checkboxes_especiais[tecla] = var
 
-# Slider de velocidade
-label_vel = ctk.CTkLabel(app, text="Velocidade (intervalo em segundos):")
-label_vel.pack(pady=5)
-velocidade_slider = ctk.CTkSlider(app, from_=0.001, to=1.0, number_of_steps=1000)
+ctk.CTkLabel(frame_autoclick, text="Velocidade (0.001s a 1s):").pack(pady=2)
+velocidade_slider = ctk.CTkSlider(frame_autoclick, from_=0.001, to=1.0, number_of_steps=1000)
 velocidade_slider.set(0.5)
-velocidade_slider.pack(pady=10)
-valor_label = ctk.CTkLabel(app, text="0.500s")
-valor_label.pack(pady=5)
-def atualizar_valor(value):
-    valor_label.configure(text=f"{float(value):.3f}s")
-velocidade_slider.configure(command=atualizar_valor)
+velocidade_slider.pack(pady=2)
+valor_label = ctk.CTkLabel(frame_autoclick, text="0.500s")
+valor_label.pack(pady=2)
+velocidade_slider.configure(command=lambda v: valor_label.configure(text=f"{float(v):.3f}s"))
 
-# Modo infinito ou número de repetições
 modo_infinito = ctk.BooleanVar(value=True)
-checkbox_infinito = ctk.CTkCheckBox(app, text="Modo infinito", variable=modo_infinito)
-checkbox_infinito.pack(pady=5)
-label_repeticoes = ctk.CTkLabel(app, text="Número de repetições (se não infinito):")
-label_repeticoes.pack(pady=5)
-entry_repeticoes = ctk.CTkEntry(app)
-entry_repeticoes.pack(pady=5)
+ctk.CTkCheckBox(frame_autoclick, text="Modo infinito", variable=modo_infinito).pack(pady=2)
+ctk.CTkLabel(frame_autoclick, text="Número de repetições:").pack(pady=2)
+entry_repeticoes = ctk.CTkEntry(frame_autoclick)
+entry_repeticoes.pack(pady=2)
 
-# Contador
+frame_btn = ctk.CTkFrame(frame_autoclick)
+frame_btn.pack(pady=5)
+ctk.CTkButton(frame_btn, text="▶ Auto Clicker", command=lambda: threading.Thread(target=iniciar_auto_click, daemon=True).start(),
+              fg_color="#32CD32", hover_color="#228B22").grid(row=0, column=0, padx=5, pady=5)
+ctk.CTkButton(frame_btn, text="⏹ Parar", command=parar, fg_color="#FF4500", hover_color="#B22222").grid(row=0, column=1, padx=5, pady=5)
+
+# --- Painel Macro ---
+frame_macro = ctk.CTkFrame(app, fg_color="#800080")
+frame_macro.pack(pady=5, padx=10, fill="x")
+ctk.CTkLabel(frame_macro, text="Macro Recorder", font=("Arial", 16, "bold")).pack(pady=5)
+
+frame_macro_btn = ctk.CTkFrame(frame_macro)
+frame_macro_btn.pack(pady=5)
+ctk.CTkButton(frame_macro_btn, text="⏺ Gravar Macro", command=iniciar_gravacao, fg_color="#8A2BE2", hover_color="#4B0082").grid(row=0, column=0, padx=5, pady=5)
+ctk.CTkButton(frame_macro_btn, text="⏹ Parar Gravação", command=parar_gravacao, fg_color="#6A0DAD", hover_color="#301934").grid(row=0, column=1, padx=5, pady=5)
+ctk.CTkButton(frame_macro_btn, text="▶ Executar Macro", command=lambda: threading.Thread(target=executar_macro, daemon=True).start(),
+              fg_color="#32CD32", hover_color="#228B22").grid(row=0, column=2, padx=5, pady=5)
+
+listbox_macros = ctk.CTkTextbox(frame_macro, height=150)
+listbox_macros.pack(pady=5, fill="x")
+
+# --- Painel Configurações ---
+frame_config = ctk.CTkFrame(app, fg_color="#1E90FF")
+frame_config.pack(pady=5, padx=10, fill="x")
+ctk.CTkLabel(frame_config, text="Configurações", font=("Arial", 16, "bold")).pack(pady=5)
+ctk.CTkButton(frame_config, text="💾 Salvar Config", command=salvar_config, fg_color="#1E90FF", hover_color="#104E8B").pack(side="left", padx=5, pady=5)
+ctk.CTkButton(frame_config, text="📂 Carregar Config", command=carregar_config, fg_color="#FFA500", hover_color="#FF8C00").pack(side="left", padx=5, pady=5)
+
+# --- Status e contador ---
+label_status = ctk.CTkLabel(app, text="Status: Pronto", font=("Arial", 14))
+label_status.pack(pady=5)
 label_contador = ctk.CTkLabel(app, text="Repetições executadas: 0")
 label_contador.pack(pady=5)
 
-# Botões
-frame_btn = ctk.CTkFrame(app)
-frame_btn.pack(pady=20)
-btn_iniciar = ctk.CTkButton(frame_btn, text="▶ Iniciar", command=iniciar, fg_color="green", hover_color="darkgreen")
-btn_iniciar.grid(row=0, column=0, padx=10)
-btn_parar = ctk.CTkButton(frame_btn, text="⏹ Parar", command=parar, fg_color="red", hover_color="darkred")
-btn_parar.grid(row=0, column=1, padx=10)
-btn_salvar = ctk.CTkButton(frame_btn, text="💾 Salvar Config", command=salvar_config, fg_color="blue", hover_color="darkblue")
-btn_salvar.grid(row=1, column=0, padx=10, pady=5)
-btn_carregar = ctk.CTkButton(frame_btn, text="📂 Carregar Config", command=carregar_config, fg_color="orange", hover_color="darkorange")
-btn_carregar.grid(row=1, column=1, padx=10, pady=5)
-
-# Carrega configuração inicial se existir
+# Carrega configuração inicial
 carregar_config()
 
-# Rodando interface
+# Rodar interface
 app.mainloop()
