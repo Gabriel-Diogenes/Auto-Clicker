@@ -1,18 +1,25 @@
+# autoclicker.py
 import sys
 import os
 import json
 import time
 import threading
-from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any
 
-from PySide6.QtCore import Qt, Signal, QObject, QThread, QTimer
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize, QPropertyAnimation
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QCheckBox, QSlider, QDoubleSpinBox, QSpinBox, QTextEdit, QListWidget, QListWidgetItem,
-    QStackedWidget, QFrame, QMessageBox, QComboBox, QFileDialog, QSizePolicy, QGridLayout
+    QLineEdit, QCheckBox, QSlider, QDoubleSpinBox, QSpinBox, QTextEdit, QStackedWidget,
+    QFrame, QMessageBox, QComboBox, QFileDialog, QGridLayout, QScrollArea, QProgressBar,
+    QSizePolicy, QGraphicsOpacityEffect
 )
-from PySide6.QtGui import QIcon, QFont, QPalette, QColor, QCursor
+from PySide6.QtGui import QIcon, QCursor
+
+# try qtawesome for icons (fallback to None / emojis)
+try:
+    import qtawesome as qta
+except Exception:
+    qta = None
 
 # ====== Automação de teclado e mouse
 from pynput.keyboard import Controller, Listener, Key, KeyCode
@@ -45,20 +52,30 @@ class Bus(QObject):
 
 bus = Bus()
 
-# ====== Estado global simples (poderia virar uma classe dedicada)
+# ====== Estado global simples
 executando = False
 gravando = False
 gravando_mouse = False
 contador = 0
-macro_gravado_teclado: List[Tuple[Any, str, float]] = []  # (tecla, "press"/"release", delay_base)
-macro_gravado_mouse: List[Tuple[Any, Any, float]] = [] # (tipo, valor, delay_base)
-ultimo_tempo = 0.0 # <--- Variável global para gravação de tempo
+macro_gravado_teclado: List[Tuple[Any, str, float]] = []
+macro_gravado_mouse: List[Tuple[Any, Any, float]] = []
+ultimo_tempo = 0.0
 
 def fmt_macro_lines_teclado(macro: List[Tuple[Any, str, float]]) -> str:
     lines = []
     for i, (t, a, d) in enumerate(macro):
         delay_str = f"{d:.4f}s" if d > 0.001 else "0.000s"
-        lines.append(f"{i+1:02d}: {str(t).replace('Key.', '')} - {a.capitalize()} (Delay: {delay_str})")
+        t_str = ""
+        try:
+            if isinstance(t, Key):
+                t_str = f"Key.{t.name}"
+            elif isinstance(t, KeyCode):
+                t_str = t.char if t.char is not None else str(t)
+            else:
+                t_str = str(t)
+        except Exception:
+            t_str = str(t)
+        lines.append(f"{i+1:02d}: {t_str} - {a.capitalize()} (Delay: {delay_str})")
     return "\n".join(lines)
 
 def fmt_macro_lines_mouse(macro: List[Tuple[Any, Any, float]]) -> str:
@@ -68,15 +85,18 @@ def fmt_macro_lines_mouse(macro: List[Tuple[Any, Any, float]]) -> str:
         if action_type == "move":
             lines.append(f"{i+1:02d}: Mover para ({value[0]}, {value[1]}) (Delay: {delay_str})")
         elif action_type == "click":
-            lines.append(f"{i+1:02d}: Clique {str(value).split('.')[-1].capitalize()} (Delay: {delay_str})")
+            try:
+                btn = str(value).split('.')[-1].capitalize()
+            except Exception:
+                btn = str(value)
+            lines.append(f"{i+1:02d}: Clique {btn} (Delay: {delay_str})")
         elif action_type == "scroll":
             lines.append(f"{i+1:02d}: Rolagem {value[0]} (Delay: {delay_str})")
         elif action_type == "position":
              lines.append(f"{i+1:02d}: Pos. Fixa ({value[0]}, {value[1]})")
     return "\n".join(lines)
 
-
-# ====== Worker helpers
+# ====== Bus helpers
 def set_status(text: str):
     bus.status.emit(text)
 
@@ -89,31 +109,31 @@ def set_macro_text_teclado(macro: List[Tuple[Any, str, float]]):
 def set_macro_text_mouse(macro: List[Tuple[Any, Any, float]]):
     bus.macro_mouse_text.emit(fmt_macro_lines_mouse(macro))
 
-
-# ====== Listeners globais
+# ====== Global listeners
 def start_global_listener(main_window):
     global ultimo_tempo, macro_gravado_teclado, gravando, gravando_mouse
     
-    # Flags para as teclas modificadoras (Ctrl e Shift)
     ctrl_pressed = False
     shift_pressed = False
 
     def on_press_teclado(key):
         nonlocal ctrl_pressed, shift_pressed
         global gravando, ultimo_tempo, macro_gravado_teclado
-        
-        # Monitora o estado das teclas Ctrl e Shift
+
         if key == Key.ctrl_l or key == Key.ctrl_r:
             ctrl_pressed = True
         if key == Key.shift_l or key == Key.shift_r:
             shift_pressed = True
 
-        # Atalho para capturar a posição do mouse
-        if ctrl_pressed and shift_pressed and isinstance(key, KeyCode) and key.char == 'c':
+        # atalho de captura de posição (Ctrl+Shift+c)
+        try:
+            cond_char = getattr(key, "char", None)
+        except Exception:
+            cond_char = None
+        if ctrl_pressed and shift_pressed and cond_char == 'c':
             main_window.capture_mouse_position()
             return
         
-        # Ignora o atalho de gravação para que ele não seja registrado na macro
         key_name = main_window._key_to_str(key)
         hotkey_gravar_teclado = main_window.hotkeys.get("gravar_macro_teclado")
         hotkey_gravar_mouse = main_window.hotkeys.get("gravar_macro_mouse")
@@ -136,7 +156,6 @@ def start_global_listener(main_window):
         nonlocal ctrl_pressed, shift_pressed
         global gravando, ultimo_tempo, macro_gravado_teclado
         
-        # Ignora o atalho de gravação
         key_name = main_window._key_to_str(key)
         hotkey_gravar_teclado = main_window.hotkeys.get("gravar_macro_teclado")
         hotkey_gravar_mouse = main_window.hotkeys.get("gravar_macro_mouse")
@@ -152,7 +171,7 @@ def start_global_listener(main_window):
         
         if gravando:
             if key == Key.esc:
-                return # Já tratado no press
+                return
             agora = time.time()
             atraso = agora - ultimo_tempo
             macro_gravado_teclado.append((key, "release", atraso))
@@ -191,8 +210,6 @@ def start_global_listener(main_window):
     def on_press_global(key):
         try:
             hotkeys = main_window.hotkeys
-            
-            # Converte a tecla pressionada para o formato de string usado nas configs
             key_name = main_window._key_to_str(key)
             
             if key_name == hotkeys.get("macro_teclado"):
@@ -205,7 +222,6 @@ def start_global_listener(main_window):
                  threading.Thread(target=main_window.start_macro_mouse, daemon=True).start()
             elif key_name == hotkeys.get("parar_tudo"):
                 main_window.stop_all()
-            # Novos atalhos de gravação
             elif key_name == hotkeys.get("gravar_macro_teclado"):
                 main_window.start_record_teclado()
             elif key_name == hotkeys.get("gravar_macro_mouse"):
@@ -232,7 +248,6 @@ def start_global_listener(main_window):
 
     return keyboard_listener, mouse_listener
 
-
 # ====== Páginas (QWidgets)
 
 class PageAutoClickers(QWidget):
@@ -242,15 +257,22 @@ class PageAutoClickers(QWidget):
 
     def build_ui(self):
         root = QVBoxLayout(self)
+
         title = QLabel("Auto Clickers")
         title.setObjectName("pageTitle")
         root.addWidget(title)
 
-        # Seção de Auto Clicker de Teclado
+        main_grid = QGridLayout()
+        main_grid.setHorizontalSpacing(20)
+        
+        # --- Seção de Auto Clicker de Teclado ---
         keys_frame = QFrame()
         keys_frame.setObjectName("sectionFrame")
         keys_layout = QVBoxLayout(keys_frame)
-        keys_layout.addWidget(QLabel("Auto Clicker de Teclado:"))
+        
+        keys_title = QLabel("Auto Clicker de Teclado")
+        keys_title.setObjectName("sectionTitle")
+        keys_layout.addWidget(keys_title)
         
         row_keys = QHBoxLayout()
         row_keys.addWidget(QLabel("Teclas normais (ex: wasd):"))
@@ -264,19 +286,27 @@ class PageAutoClickers(QWidget):
 
         self.chk_specials: Dict[str, QCheckBox] = {}
         specials_grid = QHBoxLayout()
-        for i, name in enumerate(SPECIAL_KEYS.keys()):
+        for name in SPECIAL_KEYS.keys():
             chk = QCheckBox(name)
             chk.setChecked(False)
             self.chk_specials[name] = chk
             specials_grid.addWidget(chk)
         keys_layout.addLayout(specials_grid)
-        root.addWidget(keys_frame)
+        
+        self.btn_start_keyboard_ac = QPushButton("▶ Iniciar Auto Clicker Teclado")
+        self.btn_start_keyboard_ac.setObjectName("startButton")
+        keys_layout.addWidget(self.btn_start_keyboard_ac)
+        
+        main_grid.addWidget(keys_frame, 0, 0, 1, 1)
 
-        # Seção de Auto Clicker de Mouse
+        # --- Seção de Auto Clicker de Mouse ---
         mouse_ac_frame = QFrame()
         mouse_ac_frame.setObjectName("sectionFrame")
         mouse_ac_layout = QVBoxLayout(mouse_ac_frame)
-        mouse_ac_layout.addWidget(QLabel("Auto Clicker do Mouse:"))
+        
+        mouse_title = QLabel("Auto Clicker do Mouse")
+        mouse_title.setObjectName("sectionTitle")
+        mouse_ac_layout.addWidget(mouse_title)
 
         row_button = QHBoxLayout()
         row_button.addWidget(QLabel("Botão do mouse:"))
@@ -285,12 +315,23 @@ class PageAutoClickers(QWidget):
         self.combo_mouse_button.setCurrentText("Esquerdo")
         row_button.addWidget(self.combo_mouse_button)
         mouse_ac_layout.addLayout(row_button)
-        root.addWidget(mouse_ac_frame)
+        
+        self.btn_start_mouse_ac = QPushButton("▶ Iniciar Auto Clicker Mouse")
+        self.btn_start_mouse_ac.setObjectName("startButton")
+        mouse_ac_layout.addWidget(self.btn_start_mouse_ac)
+        
+        main_grid.addWidget(mouse_ac_frame, 0, 1, 1, 1)
 
-        # Seção de Configuração Comum
+        root.addLayout(main_grid)
+
+        # --- Seção de Configuração Comum ---
         config_frame = QFrame()
         config_frame.setObjectName("sectionFrame")
         config_layout = QVBoxLayout(config_frame)
+        
+        config_title = QLabel("Configurações de Execução")
+        config_title.setObjectName("sectionTitle")
+        config_layout.addWidget(config_title)
 
         row_speed = QHBoxLayout()
         row_speed.addWidget(QLabel("Delay entre ciclos (s):"))
@@ -303,7 +344,7 @@ class PageAutoClickers(QWidget):
 
         self.slider_speed = QSlider(Qt.Orientation.Horizontal)
         self.slider_speed.setRange(1, 1000)
-        self.slider_speed.setValue(int(self.spin_speed.value() * 10))
+        self.slider_speed.setValue(int(self.spin_speed.value() * 1000))
         
         self.slider_speed.valueChanged.connect(lambda val: self.spin_speed.setValue(val / 1000.0))
         self.spin_speed.valueChanged.connect(lambda val: self.slider_speed.setValue(int(val * 1000)))
@@ -317,27 +358,21 @@ class PageAutoClickers(QWidget):
         self.chk_infinite.setChecked(True)
         self.chk_infinite.stateChanged.connect(self._toggle_reps)
         row_rep.addWidget(self.chk_infinite)
-        row_rep.addWidget(QLabel("Repetições:"))
+        lbl_reps = QLabel("Repetições:")
+        lbl_reps.setFixedWidth(110)
+        row_rep.addWidget(lbl_reps)
         self.spin_reps = QSpinBox()
         self.spin_reps.setRange(1, 999999)
         self.spin_reps.setValue(1)
-        self.spin_reps.setEnabled(False) # Inicia desabilitado
+        self.spin_reps.setEnabled(False)
         row_rep.addWidget(self.spin_reps)
         config_layout.addLayout(row_rep)
         
+        self.btn_stop = QPushButton("⏹ Parar Tudo")
+        config_layout.addWidget(self.btn_stop)
+        
         root.addWidget(config_frame)
         
-        row_btns = QHBoxLayout()
-        self.btn_start_keyboard_ac = QPushButton("▶ Iniciar Auto Clicker Teclado")
-        self.btn_start_keyboard_ac.setObjectName("startButton")
-        self.btn_start_mouse_ac = QPushButton("▶ Iniciar Auto Clicker Mouse")
-        self.btn_start_mouse_ac.setObjectName("startButton")
-        self.btn_stop = QPushButton("⏹ Parar Tudo")
-        row_btns.addWidget(self.btn_start_keyboard_ac)
-        row_btns.addWidget(self.btn_start_mouse_ac)
-        row_btns.addWidget(self.btn_stop)
-        root.addLayout(row_btns)
-
         root.addStretch()
 
     def _toggle_reps(self, state):
@@ -372,11 +407,9 @@ class PageAutoClickers(QWidget):
             if name in self.chk_specials:
                 self.chk_specials[name].setChecked(bool(v))
         
-        # --- Modificação para a velocidade ---
         speed_val = float(cfg.get("velocidade", 0.5))
         self.spin_speed.setValue(speed_val)
         self.slider_speed.setValue(int(speed_val * 1000))
-        # ------------------------------------
 
         self.chk_infinite.setChecked(bool(cfg.get("modo_infinito", True)))
         self._toggle_reps(self.chk_infinite.checkState())
@@ -409,18 +442,21 @@ class PageMacros(QWidget):
         title.setObjectName("pageTitle")
         root.addWidget(title)
         
-        # Layout principal com 2 colunas
         grid_layout = QGridLayout()
         grid_layout.setHorizontalSpacing(20)
         
-        # Coluna da esquerda (Teclado)
+        # --- Seção de Macro de Teclado ---
         teclado_frame = QFrame()
         teclado_frame.setObjectName("sectionFrame")
         teclado_layout = QVBoxLayout(teclado_frame)
-        teclado_layout.addWidget(QLabel("Macro de Teclado:"))
-        
+
+        teclado_title = QLabel("Macro de Teclado")
+        teclado_title.setObjectName("sectionTitle")
+        teclado_layout.addWidget(teclado_title)
+
         row_teclado_rec = QHBoxLayout()
         self.btn_rec_teclado = QPushButton("⏺ Gravar Macro")
+        self.btn_rec_teclado.setObjectName("recButton")
         self.btn_stop_rec_teclado = QPushButton("⏹ Parar Gravação")
         row_teclado_rec.addWidget(self.btn_rec_teclado)
         row_teclado_rec.addWidget(self.btn_stop_rec_teclado)
@@ -440,11 +476,11 @@ class PageMacros(QWidget):
         self.txt_macro_teclado.setMinimumHeight(160)
         teclado_layout.addWidget(self.txt_macro_teclado)
 
-        # Seção de perfis de teclado
+        # --- Seção de Perfis de Teclado ---
         profiles_frame = QFrame()
-        profiles_frame.setObjectName("sectionFrame")
+        profiles_frame.setObjectName("subSectionFrame")
         profiles_layout = QVBoxLayout(profiles_frame)
-        profiles_layout.addWidget(QLabel("Gerenciar Perfis de Teclado:"))
+        profiles_layout.addWidget(QLabel("Gerenciar Perfis:"))
         
         prof_row1 = QHBoxLayout()
         self.input_profile_name = QLineEdit()
@@ -456,8 +492,8 @@ class PageMacros(QWidget):
 
         prof_row2 = QHBoxLayout()
         self.combo_profiles = QComboBox()
-        self.btn_profile_load = QPushButton("📂 Carregar Perfil")
-        self.btn_profile_delete = QPushButton("🗑️ Excluir Perfil")
+        self.btn_profile_load = QPushButton("📂 Carregar")
+        self.btn_profile_delete = QPushButton("🗑️ Excluir")
         prof_row2.addWidget(self.combo_profiles)
         prof_row2.addWidget(self.btn_profile_load)
         prof_row2.addWidget(self.btn_profile_delete)
@@ -466,14 +502,18 @@ class PageMacros(QWidget):
 
         grid_layout.addWidget(teclado_frame, 0, 0, 1, 1)
 
-        # Coluna da direita (Mouse)
+        # --- Seção de Macro de Mouse ---
         mouse_frame = QFrame()
         mouse_frame.setObjectName("sectionFrame")
         mouse_layout = QVBoxLayout(mouse_frame)
-        mouse_layout.addWidget(QLabel("Macro de Mouse:"))
+        
+        mouse_title = QLabel("Macro de Mouse")
+        mouse_title.setObjectName("sectionTitle")
+        mouse_layout.addWidget(mouse_title)
         
         row_mouse_rec = QHBoxLayout()
         self.btn_rec_mouse = QPushButton("⏺ Gravar Macro")
+        self.btn_rec_mouse.setObjectName("recButton")
         self.btn_stop_rec_mouse = QPushButton("⏹ Parar Gravação")
         row_mouse_rec.addWidget(self.btn_rec_mouse)
         row_mouse_rec.addWidget(self.btn_stop_rec_mouse)
@@ -502,12 +542,15 @@ class PageMacros(QWidget):
 
         root.addLayout(grid_layout)
         
-        # Seção de repetições para macros
+        # --- Seção de Configuração Comum de Macro ---
         macro_reps_frame = QFrame()
         macro_reps_frame.setObjectName("sectionFrame")
         macro_reps_layout = QVBoxLayout(macro_reps_frame)
+        
+        macro_config_title = QLabel("Configurações de Execução")
+        macro_config_title.setObjectName("sectionTitle")
+        macro_reps_layout.addWidget(macro_config_title)
 
-        # Slider de velocidade
         row_speed = QHBoxLayout()
         row_speed.addWidget(QLabel("Delay entre ciclos (s):"))
 
@@ -528,17 +571,18 @@ class PageMacros(QWidget):
         row_speed.addWidget(self.spin_macro_speed)
         macro_reps_layout.addLayout(row_speed)
 
-        # Checkbox e Spinbox de repetições
         row_rep = QHBoxLayout()
         self.chk_macro_infinite = QCheckBox("Modo infinito")
         self.chk_macro_infinite.setChecked(True)
         self.chk_macro_infinite.stateChanged.connect(self._toggle_reps)
         row_rep.addWidget(self.chk_macro_infinite)
-        row_rep.addWidget(QLabel("Repetições:"))
+        lbl_macro_reps = QLabel("Repetições:")
+        lbl_macro_reps.setFixedWidth(110)
+        row_rep.addWidget(lbl_macro_reps)
         self.spin_macro_reps = QSpinBox()
         self.spin_macro_reps.setRange(1, 999999)
         self.spin_macro_reps.setValue(1)
-        self.spin_macro_reps.setEnabled(False) # Inicia desabilitado
+        self.spin_macro_reps.setEnabled(False)
         row_rep.addWidget(self.spin_macro_reps)
         macro_reps_layout.addLayout(row_rep)
         root.addWidget(macro_reps_frame)
@@ -576,16 +620,6 @@ class PageSettings(QWidget):
         self.current_hotkey_field = None
         self.hotkey_listener = None
         self.build_ui()
-        self.window().hotkey_fields = { # Mapeamento para facilitar a busca
-            "autoclicker_teclado": self.input_ac_teclado,
-            "autoclicker_mouse": self.input_ac_mouse,
-            "macro_teclado": self.input_macro_teclado,
-            "macro_mouse": self.input_macro_mouse,
-            "parar_tudo": self.input_parar_tudo,
-            "gravar_macro_teclado": self.input_gravar_macro_teclado,
-            "gravar_macro_mouse": self.input_gravar_macro_mouse,
-            "parar_gravacao": self.input_parar_gravacao
-        }
 
     def build_ui(self):
         root = QVBoxLayout(self)
@@ -594,39 +628,65 @@ class PageSettings(QWidget):
         title.setObjectName("pageTitle")
         root.addWidget(title)
 
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        
+        # --- Seção de Configuração Geral ---
         general_frame = QFrame()
         general_frame.setObjectName("sectionFrame")
         general_layout = QVBoxLayout(general_frame)
-        general_layout.addWidget(QLabel("Configuração Geral:"))
+        
+        general_title = QLabel("Configuração Geral")
+        general_title.setObjectName("sectionTitle")
+        general_layout.addWidget(general_title)
+        general_layout.addWidget(QLabel("Salve ou carregue todas as configurações do aplicativo."))
+
         row1 = QHBoxLayout()
-        self.btn_save_cfg = QPushButton("💾 Salvar Configuração Geral")
-        self.btn_load_cfg = QPushButton("📂 Carregar Configuração Geral")
-        self.btn_delete_cfg = QPushButton("❌ Deletar Configuração Geral")
+        self.btn_save_cfg = QPushButton("💾 Salvar Config.")
+        self.btn_load_cfg = QPushButton("📂 Carregar Config.")
+        self.btn_delete_cfg = QPushButton("❌ Deletar Config.")
         row1.addWidget(self.btn_save_cfg)
         row1.addWidget(self.btn_load_cfg)
         row1.addWidget(self.btn_delete_cfg)
         general_layout.addLayout(row1)
-        root.addWidget(general_frame)
-
+        content_layout.addWidget(general_frame)
+        
+        # --- Seção de Perfis de Macro ---
         profiles_frame = QFrame()
         profiles_frame.setObjectName("sectionFrame")
         profiles_layout = QVBoxLayout(profiles_frame)
-        profiles_layout.addWidget(QLabel("Perfis de Macro (Importar / Exportar):"))
+        
+        profiles_title = QLabel("Perfis de Macro (Importar / Exportar)")
+        profiles_title.setObjectName("sectionTitle")
+        profiles_layout.addWidget(profiles_title)
+        profiles_layout.addWidget(QLabel("Compartilhe seus perfis de macro com outros usuários."))
+        
         row2 = QHBoxLayout()
         self.btn_export_profiles = QPushButton("⬆ Exportar Perfis")
         self.btn_import_profiles = QPushButton("⬇ Importar Perfis")
         row2.addWidget(self.btn_export_profiles)
         row2.addWidget(self.btn_import_profiles)
         profiles_layout.addLayout(row2)
-        root.addWidget(profiles_frame)
-
+        content_layout.addWidget(profiles_frame)
+        
+        # --- Seção de Atalhos Globais ---
         hotkeys_frame = QFrame()
         hotkeys_frame.setObjectName("sectionFrame")
         hotkeys_layout = QVBoxLayout(hotkeys_frame)
-        hotkeys_layout.addWidget(QLabel("Atalhos Globais:"))
+        
+        hotkeys_title = QLabel("Atalhos Globais")
+        hotkeys_title.setObjectName("sectionTitle")
+        hotkeys_layout.addWidget(hotkeys_title)
         
         grid_hotkeys = QGridLayout()
-        self.lbl_info_hotkeys = QLabel("Clique no campo para capturar uma tecla.")
+        
+        grid_hotkeys.setColumnStretch(0, 0)
+        grid_hotkeys.setColumnStretch(1, 1)
+
+        self.lbl_info_hotkeys = QLabel("Clique no campo para capturar uma tecla de atalho.")
         self.lbl_info_hotkeys.setStyleSheet("color: #a0a0b0;")
         grid_hotkeys.addWidget(self.lbl_info_hotkeys, 0, 0, 1, 2)
         
@@ -635,7 +695,6 @@ class PageSettings(QWidget):
         self.input_macro_teclado = QLineEdit(objectName="input_macro_teclado")
         self.input_macro_mouse = QLineEdit(objectName="input_macro_mouse")
         self.input_parar_tudo = QLineEdit(objectName="input_parar_tudo")
-        # Novos campos
         self.input_gravar_macro_teclado = QLineEdit(objectName="input_gravar_macro_teclado")
         self.input_gravar_macro_mouse = QLineEdit(objectName="input_gravar_macro_mouse")
         self.input_parar_gravacao = QLineEdit(objectName="input_parar_gravacao")
@@ -645,32 +704,34 @@ class PageSettings(QWidget):
         self.input_macro_teclado.setReadOnly(True)
         self.input_macro_mouse.setReadOnly(True)
         self.input_parar_tudo.setReadOnly(True)
-        # Novos campos como somente leitura
         self.input_gravar_macro_teclado.setReadOnly(True)
         self.input_gravar_macro_mouse.setReadOnly(True)
         self.input_parar_gravacao.setReadOnly(True)
         
-        grid_hotkeys.addWidget(QLabel("Autoclicker Teclado:"), 1, 0)
+        grid_hotkeys.addWidget(QLabel("Iniciar Autoclicker Teclado:"), 1, 0)
         grid_hotkeys.addWidget(self.input_ac_teclado, 1, 1)
-        grid_hotkeys.addWidget(QLabel("Autoclicker Mouse:"), 2, 0)
+        grid_hotkeys.addWidget(QLabel("Iniciar Autoclicker Mouse:"), 2, 0)
         grid_hotkeys.addWidget(self.input_ac_mouse, 2, 1)
-        grid_hotkeys.addWidget(QLabel("Macro Teclado (Executar):"), 3, 0)
+        grid_hotkeys.addWidget(QLabel("Executar Macro Teclado:"), 3, 0)
         grid_hotkeys.addWidget(self.input_macro_teclado, 3, 1)
-        grid_hotkeys.addWidget(QLabel("Macro Mouse (Executar):"), 4, 0)
+        grid_hotkeys.addWidget(QLabel("Executar Macro Mouse:"), 4, 0)
         grid_hotkeys.addWidget(self.input_macro_mouse, 4, 1)
-        grid_hotkeys.addWidget(QLabel("Macro Teclado (Gravar):"), 5, 0)
+        grid_hotkeys.addWidget(QLabel("Gravar Macro Teclado:"), 5, 0)
         grid_hotkeys.addWidget(self.input_gravar_macro_teclado, 5, 1)
-        grid_hotkeys.addWidget(QLabel("Macro Mouse (Gravar):"), 6, 0)
+        grid_hotkeys.addWidget(QLabel("Gravar Macro Mouse:"), 6, 0)
         grid_hotkeys.addWidget(self.input_gravar_macro_mouse, 6, 1)
-        grid_hotkeys.addWidget(QLabel("Parar Gravação:"), 7, 0)
+        grid_hotkeys.addWidget(QLabel("Parar Gravação (Hotkeys):"), 7, 0)
         grid_hotkeys.addWidget(self.input_parar_gravacao, 7, 1)
-        grid_hotkeys.addWidget(QLabel("Parar Tudo:"), 8, 0)
+        grid_hotkeys.addWidget(QLabel("Parar Todas as Ações:"), 8, 0)
         grid_hotkeys.addWidget(self.input_parar_tudo, 8, 1)
         
         hotkeys_layout.addLayout(grid_hotkeys)
-        root.addWidget(hotkeys_frame)
+        content_layout.addWidget(hotkeys_frame)
 
-        root.addStretch()
+        content_layout.addStretch()
+
+        scroll_area.setWidget(content_widget)
+        root.addWidget(scroll_area)
         
     def start_capture_hotkey(self, line_edit: QLineEdit):
         if self.is_capturing:
@@ -684,29 +745,35 @@ class PageSettings(QWidget):
 
         def on_press(key):
             try:
-                # Converte o objeto da tecla para string
                 key_str = self.window()._key_to_str(key)
                 if not key_str: return
                 self.current_hotkey_field.setText(key_str)
                 
-                # --- Correção: Usa o nome do objeto para identificar o campo
                 hotkey_name = self.current_hotkey_field.objectName().replace("input_", "")
-                self.window().hotkeys[hotkey_name] = key_str
-                self.window().restart_global_listeners()
-                # --- Fim da correção
+                # Se a janela existir, atualiza e reinicia listeners
+                try:
+                    win = self.window()
+                    if win:
+                        win.hotkeys[hotkey_name] = key_str
+                        win.restart_global_listeners()
+                except Exception:
+                    pass
                 
             except Exception:
                 pass
             finally:
                 self.stop_capture_hotkey()
-                return False  # Para o listener
+                return False
 
         self.hotkey_listener = Listener(on_press=on_press)
         self.hotkey_listener.start()
 
     def stop_capture_hotkey(self):
-        if self.hotkey_listener and self.hotkey_listener.running:
-            self.hotkey_listener.stop()
+        if self.hotkey_listener and getattr(self.hotkey_listener, "running", False):
+            try:
+                self.hotkey_listener.stop()
+            except Exception:
+                pass
         self.is_capturing = False
         if self.current_hotkey_field:
             self.current_hotkey_field.setPlaceholderText("")
@@ -714,7 +781,6 @@ class PageSettings(QWidget):
             self.current_hotkey_field = None
         self.lbl_info_hotkeys.setText("Clique no campo para capturar uma tecla.")
         set_status("Captura de atalho finalizada.")
-
 
 class PageAbout(QWidget):
     def __init__(self):
@@ -729,34 +795,34 @@ class PageAbout(QWidget):
 
         txt = QTextEdit()
         txt.setReadOnly(True)
-        txt.setPlainText(
-            "📖 **Como usar:**\n"
-            "1) **Página Auto Clickers:** digite teclas normais (ex.: wasd) e/ou selecione especiais, ajuste delay e repetições para o autoclicker de teclado. Use o seletor de botão para o autoclicker de mouse.\n"
-            "   - **Atenção:** Os botões de iniciar executam a automação correspondente.\n"
-            "   - Parar tudo: botão dedicado ou seu atalho global.\n"
-            "2) **Página Macros:** grave sequências de teclado ou mouse, com movimentos e cliques. `ESC` para parar a gravação.\n"
-            "   - **Atenção:** A gravação do mouse é sensível, evite movimentos bruscos e desnecessários.\n"
-            "   - **Capturar Posição:** Use o atalho **Ctrl+Shift+C** para adicionar uma posição fixa à sua macro de mouse.\n"
-            "   - Executar Macro: botões dedicados ou seus atalhos globais.\n"
-            "3) **Perfis:** salve a macro de teclado atual com um nome. Carregue/exclua pelo seletor.\n"
-            "4) **Configurações:** salve/carregue config geral, exporte/importe perfis e personalize os atalhos globais.\n\n"
-            "⚠ **Observações:**\n"
-            "- As teclas são enviadas para a janela em foco (traga o app/jogo para frente antes de executar).\n"
-            "- Alguns apps/jogos podem bloquear automação.\n"
-            "- Use por sua conta e risco; verifique termos de uso do software-alvo.\n\n"
-            "**Atalhos globais:**\n"
-            "- Os atalhos podem ser definidos na página de Configurações.\n"
-            "- **ESC:** para a gravação de macro de teclado ou mouse\n"
-        )
+        about_text = """
+        <h2 style="color:#9f7aea;">Sobre o Aplicativo</h2>
+        <p>Este aplicativo é uma poderosa ferramenta de automação para tarefas repetitivas. Com ele, você pode criar e gerenciar <b>macros de teclado e mouse</b>, além de utilizar um <b>autoclicker</b> para agilizar ações em jogos, testes de software ou qualquer atividade que exija cliques ou pressionamentos de tecla repetitivos.</p>
+        <hr style="border: 1px solid #3c3c52;">
+        <h3 style="color:#9f7aea;">Instruções de Uso</h3>
+        <ul>
+            <li><b>Macros:</b> Clique em "Gravar Macro", realize as ações e pare a gravação.</li>
+            <li><b>Autoclicker:</b> Configure delay e repetições, use os botões ou hotkeys.</li>
+            <li><b>Perfis:</b> Salve/carregue perfis para usos distintos.</li>
+        </ul>
+        <hr style="border: 1px solid #3c3c52;">
+        <p style="text-align: center; color: #7a7a7a;">
+            Versão 1.1<br>
+            Desenvolvido por Gabriel Alves da Silva Diógenes<br>
+            Copyright © 2025
+        </p>
+        """
+        txt.setHtml(about_text)
         root.addWidget(txt)
         root.addStretch()
 
-# ====== Janela principal
+# ====== Janela principal (integra tudo)
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Auto Clicker + Macro Dashboard (Qt)")
-        self.resize(1000, 650)
+        self.setMinimumSize(QSize(1200, 700))
+        self.resize(1200, 700)
         try:
             self.setWindowIcon(QIcon("app.ico"))
         except Exception:
@@ -766,34 +832,96 @@ class MainWindow(QMainWindow):
         self.keyboard_listener = None
         self.mouse_listener = None
         self.mouse_pos_timer = None
+        self._current_animation = None
+        self.current_total_reps = None
 
+        # Sidebar
         sidebar = QFrame()
-        sidebar.setFixedWidth(220)
+        sidebar.setFixedWidth(260)
         sidebar.setObjectName("sidebar")
         vside = QVBoxLayout(sidebar)
-        vside.setContentsMargins(12, 12, 12, 12)
+        vside.setContentsMargins(16, 12, 12, 12)
         
         logo = QLabel("Automator")
         logo.setObjectName("logoTitle")
         vside.addWidget(logo)
 
-        self.btn_go_auto = QPushButton("⚙️ Auto Clickers")
-        self.btn_go_macro = QPushButton("🎬 Macros")
-        self.btn_go_settings = QPushButton("🧰 Configurações")
-        self.btn_go_about = QPushButton("ℹ️ Sobre")
+        # icons attempt
+        def get_icon_try(names):
+            if qta is None:
+                return None
+            for n in names:
+                try:
+                    return qta.icon(n)
+                except Exception:
+                    continue
+            return None
+
+        icon_auto = get_icon_try(["fa.mouse-pointer", "fa5s.mouse-pointer", "fa.rocket"])
+        icon_macro = get_icon_try(["fa.keyboard-o", "fa5s.keyboard", "fa.keyboard"])
+        icon_settings = get_icon_try(["fa.cog", "fa5s.cog"])
+        icon_about = get_icon_try(["fa.info-circle", "fa5s.info-circle"])
+
+        # nav buttons (checkable)
+        self.btn_go_auto = QPushButton("  Auto Clickers")
+        if icon_auto: self.btn_go_auto.setIcon(icon_auto)
+        self.btn_go_macro = QPushButton("  Macros")
+        if icon_macro: self.btn_go_macro.setIcon(icon_macro)
+        self.btn_go_settings = QPushButton("  Configurações")
+        if icon_settings: self.btn_go_settings.setIcon(icon_settings)
+        self.btn_go_about = QPushButton("  Sobre")
+        if icon_about: self.btn_go_about.setIcon(icon_about)
+
         for b in [self.btn_go_auto, self.btn_go_macro, self.btn_go_settings, self.btn_go_about]:
             b.setObjectName("navButton")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             vside.addWidget(b)
+        self.nav_buttons = [
+            self.btn_go_auto, self.btn_go_macro,
+            self.btn_go_settings, self.btn_go_about
+        ]
             
         vside.addStretch()
         
+        # ----- RODAPÉ: status empilhado (modificação solicitada)
+        status_vbox = QVBoxLayout()
+        status_vbox.setSpacing(6)
+        status_vbox.setContentsMargins(0, 0, 0, 0)
+
+        # top row (badge + label)
+        self.status_badge = QLabel()
+        self.status_badge.setFixedSize(14, 14)
+        self.status_badge.setObjectName("statusBadge")
+        self.status_badge.setToolTip("Status: Pronto")
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignVCenter)
         self.lbl_status = QLabel("Status: Pronto")
         self.lbl_status.setObjectName("statusLabel")
+        top_row.addWidget(self.lbl_status, 0, Qt.AlignmentFlag.AlignVCenter)
+        top_row.addStretch()
+        status_vbox.addLayout(top_row)
+
+        # second row: repetições (centralizado)
         self.lbl_counter = QLabel("Repetições: 0")
         self.lbl_counter.setObjectName("counterLabel")
-        vside.addWidget(self.lbl_status)
-        vside.addWidget(self.lbl_counter)
+        self.lbl_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_vbox.addWidget(self.lbl_counter)
 
+        vside.addLayout(status_vbox)
+
+        # progress bar (hidden by default)
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        vside.addWidget(self.progress)
+
+        # pages
         self.pages = QStackedWidget()
         self.page_auto = PageAutoClickers()
         self.page_macro = PageMacros()
@@ -812,22 +940,24 @@ class MainWindow(QMainWindow):
         root.addWidget(self.pages, 1)
         self.setCentralWidget(central)
 
-        self.btn_go_auto.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_auto))
-        self.btn_go_macro.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_macro))
-        self.btn_go_settings.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_settings))
-        self.btn_go_about.clicked.connect(lambda: self.pages.setCurrentWidget(self.page_about))
+        # navigation
+        self.btn_go_auto.clicked.connect(lambda: self.set_active_page(self.btn_go_auto, self.page_auto))
+        self.btn_go_macro.clicked.connect(lambda: self.set_active_page(self.btn_go_macro, self.page_macro))
+        self.btn_go_settings.clicked.connect(lambda: self.set_active_page(self.btn_go_settings, self.page_settings))
+        self.btn_go_about.clicked.connect(lambda: self.set_active_page(self.btn_go_about, self.page_about))
+
+        self.set_active_page(self.btn_go_auto, self.page_auto)
 
         bus.status.connect(self.on_status)
         bus.counter.connect(self.on_counter)
         bus.macro_teclado_text.connect(self.page_macro.set_macro_text_teclado)
         bus.macro_mouse_text.connect(self.page_macro.set_macro_text_mouse)
 
-        # Autoclickers
+        # connections (autoclickers/macros)
         self.page_auto.btn_start_keyboard_ac.clicked.connect(self.start_auto_click_teclado)
         self.page_auto.btn_start_mouse_ac.clicked.connect(lambda: threading.Thread(target=self.start_auto_click_mouse, daemon=True).start())
         self.page_auto.btn_stop.clicked.connect(self.stop_all)
         
-        # Macros
         self.page_macro.btn_rec_teclado.clicked.connect(self.start_record_teclado)
         self.page_macro.btn_stop_rec_teclado.clicked.connect(self.stop_record_teclado)
         self.page_macro.btn_play_teclado.clicked.connect(lambda: threading.Thread(target=self.start_macro_teclado, daemon=True).start())
@@ -848,6 +978,7 @@ class MainWindow(QMainWindow):
         self.page_settings.btn_export_profiles.clicked.connect(self.export_profiles)
         self.page_settings.btn_import_profiles.clicked.connect(self.import_profiles)
         
+        # capture hotkeys mousePress mapping
         self.page_settings.input_ac_teclado.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_ac_teclado)
         self.page_settings.input_ac_mouse.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_ac_mouse)
         self.page_settings.input_macro_teclado.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_macro_teclado)
@@ -857,27 +988,59 @@ class MainWindow(QMainWindow):
         self.page_settings.input_gravar_macro_mouse.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_gravar_macro_mouse)
         self.page_settings.input_parar_gravacao.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_parar_gravacao)
 
-
         self.load_config(silent=True)
         self.load_profiles()
         self.restart_global_listeners()
         self.start_cursor_tracker()
 
+    def set_active_page(self, btn: QPushButton, page: QWidget):
+        for b in self.nav_buttons:
+            b.setChecked(False)
+        btn.setChecked(True)
+
+        # fade in effect for the target page
+        try:
+            page.setGraphicsEffect(None)
+            effect = QGraphicsOpacityEffect(page)
+            page.setGraphicsEffect(effect)
+            effect.setOpacity(0.0)
+            self.pages.setCurrentWidget(page)
+            anim = QPropertyAnimation(effect, b"opacity", self)
+            anim.setDuration(220)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            self._current_animation = anim
+            def on_finished():
+                try:
+                    page.setGraphicsEffect(None)
+                except Exception:
+                    pass
+            anim.finished.connect(on_finished)
+            anim.start()
+        except Exception:
+            # fallback: just switch
+            self.pages.setCurrentWidget(page)
+
     def restart_global_listeners(self):
-        """Reinicia os listeners globais de teclado e mouse."""
         global gravando, gravando_mouse
         gravando = False
         gravando_mouse = False
         if self.keyboard_listener:
-            self.keyboard_listener.stop()
+            try:
+                self.keyboard_listener.stop()
+            except Exception:
+                pass
         if self.mouse_listener:
-            self.mouse_listener.stop()
+            try:
+                self.mouse_listener.stop()
+            except Exception:
+                pass
         self.keyboard_listener, self.mouse_listener = start_global_listener(self)
-        set_status("Listeners globais reiniciados.")
+        set_status("Listeners reiniciados.")
         
     def start_cursor_tracker(self):
         self.mouse_pos_timer = QTimer(self)
-        self.mouse_pos_timer.setInterval(100)  # 100ms
+        self.mouse_pos_timer.setInterval(100)
         self.mouse_pos_timer.timeout.connect(self._update_mouse_pos)
         self.mouse_pos_timer.start()
 
@@ -888,12 +1051,10 @@ class MainWindow(QMainWindow):
     def capture_mouse_position(self):
         global macro_gravado_mouse
         x, y = QCursor.pos().x(), QCursor.pos().y()
-        # Tempo de espera de 0s, pois é uma posição fixa
-        macro_gravado_mouse.append(("position", (x, y), 0.0)) 
+        macro_gravado_mouse.append(("position", (x, y), 0.0))
         set_macro_text_mouse(macro_gravado_mouse)
         set_status(f"Posição ({x}, {y}) capturada.")
         
-    # ===== Ações (executadas em thread quando necessário)
     def start_auto_click_teclado(self):
         global executando, contador
         if executando:
@@ -912,6 +1073,14 @@ class MainWindow(QMainWindow):
         delay = self.page_auto.get_delay()
         infinite = self.page_auto.is_infinite()
         reps = self.page_auto.get_reps()
+        # setup progress tracking
+        if not infinite:
+            self.current_total_reps = reps
+            self.progress.setVisible(True)
+            self.progress.setValue(0)
+        else:
+            self.current_total_reps = None
+            self.progress.setVisible(False)
         
         def worker():
             global executando, contador
@@ -941,6 +1110,8 @@ class MainWindow(QMainWindow):
                 executando = False
                 gravando = False
                 gravando_mouse = False
+                self.current_total_reps = None
+                self.progress.setVisible(False)
                 set_status("Pronto")
                 
         threading.Thread(target=worker, daemon=True).start()
@@ -959,6 +1130,13 @@ class MainWindow(QMainWindow):
         contador = 0
         set_counter(contador)
         set_status("Executando Auto Clicker (Mouse)…")
+        if not infinite:
+            self.current_total_reps = reps
+            self.progress.setVisible(True)
+            self.progress.setValue(0)
+        else:
+            self.current_total_reps = None
+            self.progress.setVisible(False)
         
         def worker():
             global executando, contador
@@ -980,6 +1158,8 @@ class MainWindow(QMainWindow):
                 executando = False
                 gravando = False
                 gravando_mouse = False
+                self.current_total_reps = None
+                self.progress.setVisible(False)
                 set_status("Pronto")
                 
         threading.Thread(target=worker, daemon=True).start()
@@ -989,6 +1169,8 @@ class MainWindow(QMainWindow):
         executando = False
         gravando = False
         gravando_mouse = False
+        self.current_total_reps = None
+        self.progress.setVisible(False)
         set_status("Parado")
 
     def start_record_teclado(self):
@@ -1021,6 +1203,13 @@ class MainWindow(QMainWindow):
         infinite = self.page_macro.is_infinite()
         reps = self.page_macro.get_reps()
         delay = self.page_macro.get_delay()
+        if not infinite:
+            self.current_total_reps = reps
+            self.progress.setVisible(True)
+            self.progress.setValue(0)
+        else:
+            self.current_total_reps = None
+            self.progress.setVisible(False)
         
         def worker():
             global executando, contador
@@ -1050,6 +1239,8 @@ class MainWindow(QMainWindow):
                 executando = False
                 gravando = False
                 gravando_mouse = False
+                self.current_total_reps = None
+                self.progress.setVisible(False)
                 set_status("Pronto")
                 
         threading.Thread(target=worker, daemon=True).start()
@@ -1090,6 +1281,13 @@ class MainWindow(QMainWindow):
         infinite = self.page_macro.is_infinite()
         reps = self.page_macro.get_reps()
         delay = self.page_macro.get_delay()
+        if not infinite:
+            self.current_total_reps = reps
+            self.progress.setVisible(True)
+            self.progress.setValue(0)
+        else:
+            self.current_total_reps = None
+            self.progress.setVisible(False)
         
         def worker():
             global executando, contador
@@ -1127,6 +1325,8 @@ class MainWindow(QMainWindow):
                 executando = False
                 gravando = False
                 gravando_mouse = False
+                self.current_total_reps = None
+                self.progress.setVisible(False)
                 set_status("Pronto")
                 
         threading.Thread(target=worker, daemon=True).start()
@@ -1138,22 +1338,22 @@ class MainWindow(QMainWindow):
         set_status("Macro de mouse atual limpa.")
     
     def _key_to_str(self, key_obj: Any) -> str:
-        """Converte um objeto de tecla para uma string serializável."""
         if isinstance(key_obj, Key):
             return f"Key.{key_obj.name}"
         if isinstance(key_obj, KeyCode):
-            return key_obj.char
+            return key_obj.char if key_obj.char is not None else str(key_obj)
         return str(key_obj)
 
     def _str_to_key(self, key_str: str) -> Any:
-        """Converte uma string de volta para um objeto de tecla."""
         if key_str.startswith("Key."):
             try:
-                # Trata as teclas especiais corretamente
                 return getattr(Key, key_str.split(".")[-1])
             except AttributeError:
-                return None # Retorna None para teclas não reconhecidas
-        return KeyCode.from_char(key_str)
+                return None
+        try:
+            return KeyCode.from_char(key_str)
+        except Exception:
+            return None
     
     def _mouse_action_to_str(self, action):
         if isinstance(action, MouseButton):
@@ -1282,7 +1482,6 @@ class MainWindow(QMainWindow):
                         raise ValueError("Estrutura do arquivo de perfis inválida.")
                     
                     for name, data in profiles_json.items():
-                        # Converte a lista de strings para o formato de teclas
                         profile_data = []
                         for k_str, a, d in data:
                             try:
@@ -1312,7 +1511,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Perfis", "A macro de teclado está vazia. Não é possível salvar.")
             return
         
-        # Converte os objetos de tecla em strings antes de salvar
         macro_salva = [(self._key_to_str(k), a, d) for k, a, d in macro_gravado_teclado]
         self._profiles[name] = macro_salva
         
@@ -1384,122 +1582,219 @@ class MainWindow(QMainWindow):
 
     def on_status(self, text: str):
         self.lbl_status.setText(f"Status: {text}")
+        self.status_badge.setToolTip(f"Status: {text}")
+        lower = text.lower()
+        if "executando" in lower or "gravando" in lower:
+            self.status_badge.setStyleSheet("background: qlineargradient(x1:0 y1:0, x2:1 y2:1, stop:0 #39d353, stop:1 #22a844); border-radius: 7px;")
+        elif "pronto" in lower or "parado" in lower:
+            self.status_badge.setStyleSheet("background: #6b6b7a; border-radius: 7px;")
+        elif "erro" in lower or "não" in lower:
+            self.status_badge.setStyleSheet("background: qlineargradient(x1:0 y1:0, x2:1 y2:1, stop:0 #ff5f56, stop:1 #d6453a); border-radius: 7px;")
+        else:
+            self.status_badge.setStyleSheet("background: #6b6b7a; border-radius: 7px;")
 
     def on_counter(self, value: int):
         self.lbl_counter.setText(f"Repetições: {value}")
-
+        # atualiza progress bar se souber total de reps
+        if self.current_total_reps:
+            try:
+                pct = int(min(100, (value / self.current_total_reps) * 100))
+                self.progress.setValue(pct)
+            except Exception:
+                self.progress.setValue(0)
 
 # ====== Execução
 def main():
     app = QApplication(sys.argv)
     
     app.setStyleSheet("""
-        * {
-            font-family: 'Segoe UI', 'Helvetica', sans-serif;
-            font-size: 14px;
-        }
-        QMainWindow {
-            background: #1e1e2d;
-            color: #e0e0e0;
-        }
-        
-        #sidebar {
-            background: #2a2a3e;
-            border-right: 1px solid #3c3c52;
-        }
-        #logoTitle {
-            font-size: 24px;
-            font-weight: bold;
-            color: #ffffff;
-            margin-bottom: 20px;
-        }
-        #navButton {
-            text-align: left;
-            padding: 12px 16px;
-            background: transparent;
-            border: none;
-            color: #e0e0e0;
-            border-radius: 8px;
-        }
-        #navButton:hover {
-            background: #3c3c52;
-        }
-        #navButton:pressed {
-            background: #4a4a62;
-        }
-        #statusLabel, #counterLabel {
-            font-size: 12px;
-            color: #a0a0b0;
-        }
-        
-        #pageTitle {
-            font-size: 20px;
-            font-weight: 600;
-            color: #5c6efc;
-            margin-bottom: 15px;
-        }
-        #sectionFrame {
-            border: 1px solid #3c3c52;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
-        }
+* {
+    font-family: 'Segoe UI', 'Helvetica', sans-serif;
+    font-size: 14px;
+    color: #e6e6e6;
+}
+QMainWindow {
+    background: #15151b;
+}
 
-        QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-            background: #2a2a3e;
-            color: #e0e0e0;
-            border: 1px solid #3c3c52;
-            border-radius: 6px;
-            padding: 8px;
-        }
-        QLineEdit:read-only {
-            background: #3c3c52;
-        }
-        QComboBox::drop-down {
-            border: none;
-        }
-        QComboBox::down-arrow {
-            image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiI+PHBhdGggZD0iTTggMTFsLTggNmgxNmwzLTZ6IiBmaWxsPSIjRTBFMEUwIi8+PC9zdmc+);
-        }
+/* Sidebar */
+#sidebar {
+    background: #161622;
+    border-right: 1px solid #2b2b3b;
+    padding: 12px;
+}
+#logoTitle {
+    font-size: 26px;
+    font-weight: 700;
+    color: #b890ff;
+    margin-bottom: 18px;
+    letter-spacing: 0.4px;
+}
+#navButton {
+    text-align: left;
+    padding: 12px 18px;
+    background: transparent;
+    border: none;
+    border-radius: 10px;
+    font-weight: 600;
+    color: #dcdde6;
+}
+#navButton:hover {
+    background: #232333;
+}
+#navButton:checked {
+    background: qlineargradient(x1:0 y1:0, x2:1 y2:0, stop:0 #2b2540, stop:1 #2f2948);
+    border-left: 4px solid #b890ff;
+    padding-left: 14px;
+}
+#statusLabel, #counterLabel {
+    font-size: 13px;
+    color: #a8a8b3;
+    margin-top: 5px;
+}
 
-        QPushButton {
-            background: #3c3c52;
-            color: #e0e0e0;
-            border: none;
-            border-radius: 8px;
-            padding: 10px 15px;
-            font-weight: 500;
-        }
-        QPushButton:hover {
-            background: #4a4a62;
-        }
-        QPushButton:pressed {
-            background: #5c5c7a;
-        }
-        #startButton {
-            background: #5c6efc;
-            color: #ffffff;
-            font-weight: bold;
-        }
-        #startButton:hover {
-            background: #7a8efc;
-        }
-        #startButton:pressed {
-            background: #4a5ee0;
-        }
+/* Títulos e Containers */
+#pageTitle {
+    font-size: 22px;
+    font-weight: 700;
+    color: #f1f1f5;
+    margin-bottom: 16px;
+}
+#sectionFrame {
+    background: #161622;
+    border: 1px solid #2a2a3e;
+    border-radius: 14px;
+    padding: 18px;
+    box-shadow: 0px 6px 18px rgba(0, 0, 0, 0.25);
+}
+#sectionTitle {
+    font-size: 16px;
+    font-weight: 700;
+    color: #b890ff;
+    margin-bottom: 8px;
+}
+#subSectionFrame {
+    background: #141421;
+    border: 1px solid #20202d;
+    border-radius: 10px;
+    padding: 12px;
+    margin-top: 12px;
+}
 
-        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-            border: 1px solid #3c3c52;
-            background-color: #2a2a3e;
-            padding: 4px;
-        }
-        QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
-            background-color: #3c3c52;
-        }
-        QDoubleSpinBox::up-arrow, QDoubleSpinBox::down-arrow {
-            width: 8px;
-            height: 8px;
-        }
+/* Botões */
+QPushButton {
+    background: #222233;
+    color: #f1f1f5;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-weight: 600;
+    transition: all 0.12s ease-in-out;
+}
+QPushButton:hover {
+    background: #313143;
+}
+QPushButton:pressed {
+    background: #2b2b3b;
+    transform: translateY(1px);
+}
+#startButton {
+    background: #b890ff;
+    color: #1b1b1b;
+    font-weight: 800;
+    padding: 10px 16px;
+}
+#startButton:hover {
+    background: #c6a9ff;
+}
+#recButton {
+    background: #ff6b6b;
+    color: #fff;
+    font-weight: 700;
+}
+#recButton:hover {
+    background: #ff8080;
+}
+
+/* Campos de entrada e seleção */
+QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox {
+    background: #1f1f2a;
+    color: #eaeaf0;
+    border: 1px solid #2b2b3b;
+    border-radius: 10px;
+    padding: 8px;
+    selection-background-color: #b890ff;
+    selection-color: #0b0b0b;
+}
+QComboBox {
+    background: #1f1f2a;
+    color: #eaeaf0;
+    border: 1px solid #2b2b3b;
+    border-radius: 8px;
+    padding: 8px;
+}
+QSlider::groove:horizontal {
+    border: 1px solid #2b2b3b;
+    height: 8px;
+    background: #1f1f2a;
+    margin: 2px 0;
+    border-radius: 4px;
+}
+QSlider::handle:horizontal {
+    background: #b890ff;
+    border: none;
+    width: 16px;
+    margin: -4px 0;
+    border-radius: 8px;
+}
+
+/* Checkbox */
+QCheckBox::indicator {
+    border: 1px solid #2b2b3b;
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    background-color: #1f1f2a;
+}
+QCheckBox::indicator:checked {
+    background-color: #b890ff;
+    border: 1px solid #b890ff;
+}
+
+/* ScrollArea and Scrollbars */
+QScrollArea {
+    border: none;
+}
+QScrollBar:vertical {
+    border: none;
+    background: #161622;
+    width: 10px;
+}
+QScrollBar::handle:vertical {
+    background: #1f1f2a;
+    min-height: 20px;
+    border-radius: 5px;
+}
+
+/* progress */
+QProgressBar {
+    background: #151521;
+    border: 1px solid #23232f;
+    border-radius: 8px;
+    height: 8px;
+}
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #b890ff, stop:1 #8f62ff);
+    border-radius: 8px;
+}
+#statusBadge {
+    border-radius: 7px;
+}
+
+/* small adjustments responsiveness */
+QWidget {
+    outline: none;
+}
     """)
     
     win = MainWindow()
