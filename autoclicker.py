@@ -43,6 +43,10 @@ SPECIAL_KEYS: Dict[str, Key] = {
     "Esc": Key.esc,
 }
 
+# Mapeamento para salvar / carregar
+KEY_MAP_SAVE = {v: f"Key.{k}" for k, v in SPECIAL_KEYS.items()}
+KEY_MAP_LOAD = {v: k for k, v in KEY_MAP_SAVE.items()}
+
 # ====== Estado e comunicação com a UI via sinais (thread-safe)
 class Bus(QObject):
     status = Signal(str)      # texto de status
@@ -1339,7 +1343,7 @@ class MainWindow(QMainWindow):
     
     def _key_to_str(self, key_obj: Any) -> str:
         if isinstance(key_obj, Key):
-            return f"Key.{key_obj.name}"
+            return KEY_MAP_SAVE.get(key_obj, f"Key.{key_obj.name}")
         if isinstance(key_obj, KeyCode):
             return key_obj.char if key_obj.char is not None else str(key_obj)
         return str(key_obj)
@@ -1347,9 +1351,15 @@ class MainWindow(QMainWindow):
     def _str_to_key(self, key_str: str) -> Any:
         if key_str.startswith("Key."):
             try:
+                # Trata as chaves especiais mapeadas primeiro
+                mapped_key = KEY_MAP_LOAD.get(key_str)
+                if mapped_key:
+                    return mapped_key
+                # Tenta mapear outras teclas especiais
                 return getattr(Key, key_str.split(".")[-1])
             except AttributeError:
                 return None
+        # Trata caracteres normais
         try:
             return KeyCode.from_char(key_str)
         except Exception:
@@ -1511,12 +1521,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Perfis", "A macro de teclado está vazia. Não é possível salvar.")
             return
         
-        macro_salva = [(self._key_to_str(k), a, d) for k, a, d in macro_gravado_teclado]
-        self._profiles[name] = macro_salva
+        # 1. Adiciona a macro atual (com objetos pynput) aos perfis em memória
+        self._profiles[name] = macro_gravado_teclado
+        
+        # 2. Cria um dicionário temporário com os textos das teclas, pronto para salvar
+        profiles_to_save = {}
+        for p_name, p_data in self._profiles.items():
+            profiles_to_save[p_name] = [(self._key_to_str(k), a, d) for k, a, d in p_data]
         
         try:
+            # 3. Salva o dicionário temporário no arquivo JSON
             with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._profiles, f, ensure_ascii=False, indent=2)
+                json.dump(profiles_to_save, f, ensure_ascii=False, indent=2)
             self.page_macro.refresh_profiles(self._profiles)
             set_status(f"Perfil '{name}' salvo.")
         except Exception as e:
@@ -1544,9 +1560,18 @@ class MainWindow(QMainWindow):
             set_status("Nenhum perfil selecionado.")
             return
         if name in self._profiles:
+            # 1. Remove o perfil do dicionário em memória
             del self._profiles[name]
+            
+            # 2. Cria uma versão com textos do dicionário atualizado para salvar
+            profiles_to_save = {}
+            for p_name, p_data in self._profiles.items():
+                profiles_to_save[p_name] = [(self._key_to_str(k), a, d) for k, a, d in p_data]
+
+            # 3. Salva o dicionário temporário no arquivo
             with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._profiles, f, ensure_ascii=False, indent=2)
+                json.dump(profiles_to_save, f, ensure_ascii=False, indent=2)
+
             self.page_macro.refresh_profiles(self._profiles)
             set_status(f"Perfil '{name}' excluído.")
         else:
@@ -1559,8 +1584,13 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Exportar Perfis", "perfis.json", "JSON (*.json)")
         if not path: return
         try:
+            # Para exportar, também precisamos converter para o formato de texto
+            profiles_to_export = {}
+            for p_name, p_data in self._profiles.items():
+                profiles_to_export[p_name] = [(self._key_to_str(k), a, d) for k, a, d in p_data]
+
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._profiles, f, ensure_ascii=False, indent=2)
+                json.dump(profiles_to_export, f, ensure_ascii=False, indent=2)
             set_status(f"Perfis exportados para: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Erro de Exportação", f"Erro ao exportar: {e}")
@@ -1572,9 +1602,24 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8") as f:
                 data_from_file = json.load(f)
             if not isinstance(data_from_file, dict): raise ValueError("Estrutura do arquivo inválida. Esperado um dicionário.")
-            self._profiles.update(data_from_file)
+            
+            # Converte os dados importados para o formato de objeto pynput antes de adicionar
+            for name, data in data_from_file.items():
+                profile_data = []
+                for k_str, a, d in data:
+                    key_obj = self._str_to_key(k_str)
+                    if key_obj:
+                        profile_data.append((key_obj, a, d))
+                self._profiles[name] = profile_data
+
+            # Salva a lista de perfis mesclada e atualizada
+            profiles_to_save = {}
+            for p_name, p_data in self._profiles.items():
+                profiles_to_save[p_name] = [(self._key_to_str(k), a, d) for k, a, d in p_data]
+
             with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._profiles, f, ensure_ascii=False, indent=2)
+                json.dump(profiles_to_save, f, ensure_ascii=False, indent=2)
+
             self.page_macro.refresh_profiles(self._profiles)
             set_status("Perfis importados.")
         except Exception as e:
