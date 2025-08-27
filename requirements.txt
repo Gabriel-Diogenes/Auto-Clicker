@@ -1,0 +1,7 @@
+PySide6
+pynput
+qtawesome
+pywin32
+opencv-python
+numpy
+Pillow

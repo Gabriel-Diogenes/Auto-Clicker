@@ -1,4 +1,4 @@
-# autoclicker.py
+# autoclicker.py (VERSÃO REATORADA E ESTÁVEL)
 import sys
 import os
 import json
@@ -6,223 +6,210 @@ import time
 import threading
 import random
 from typing import List, Tuple, Dict, Any
+import ctypes
+from enum import Enum, auto
 
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize, QPropertyAnimation, QUrl
+# PySide6 Imports
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize, QUrl, QRect, QThread, QPropertyAnimation
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QCheckBox, QSlider, QDoubleSpinBox, QSpinBox, QTextEdit, QStackedWidget,
     QFrame, QMessageBox, QComboBox, QFileDialog, QGridLayout, QScrollArea, QProgressBar,
     QSizePolicy, QGraphicsOpacityEffect, QMenu, QSystemTrayIcon, QListWidget, QInputDialog
 )
-from PySide6.QtGui import QIcon, QCursor, QAction, QPixmap, QPainter, QColor, QScreen
+from PySide6.QtGui import QIcon, QCursor, QAction, QPixmap, QPainter, QColor, QScreen, QPen
 from PySide6.QtMultimedia import QSoundEffect
 from PIL import ImageGrab
 
-# try qtawesome for icons (fallback to None / emojis)
+# Tenta importar bibliotecas opcionais
 try:
     import qtawesome as qta
-except Exception:
+except ImportError:
     qta = None
+try:
+    import win32gui
+    PYWIN32_AVAILABLE = True
+except ImportError:
+    PYWIN32_AVAILABLE = False
+import cv2
+import numpy as np
 
-# ====== Automação de teclado e mouse
-from pynput.keyboard import Controller, Listener, Key, KeyCode
+# pynput Imports
+from pynput.keyboard import Controller as KeyboardController, Listener as KeyboardListener, Key, KeyCode
 from pynput.mouse import Controller as MouseController, Button as MouseButton, Listener as MouseListener
 
-keyboard = Controller()
-mouse = MouseController()
+# --- ARQUITETURA REFEITA: ESTADO E COMUNICAÇÃO ---
 
-PROFILES_FILE = "macro_profiles.json"
+class AppState(Enum):
+    """Define o estado atual da aplicação de forma clara e segura."""
+    IDLE = auto()
+    EXECUTING = auto()
+    RECORDING_KEYBOARD = auto()
+    RECORDING_MOUSE = auto()
 
-# ----- Teclas especiais mapeadas
-SPECIAL_KEYS: Dict[str, Key] = {
-    "Espaço": Key.space,
-    "Enter": Key.enter,
-    "Shift": Key.shift,
-    "Ctrl": Key.ctrl,
-    "Alt": Key.alt,
-    "Tab": Key.tab,
-    "Backspace": Key.backspace,
-    "Esc": Key.esc,
-}
-
-# Mapeamento para salvar / carregar
-KEY_MAP_SAVE = {v: f"Key.{k}" for k, v in SPECIAL_KEYS.items()}
-KEY_MAP_LOAD = {v: k for k, v in KEY_MAP_SAVE.items()}
-
-# ====== Estado e comunicação com a UI via sinais (thread-safe)
 class Bus(QObject):
-    status = Signal(str)
-    counter = Signal(int)
-    macro_teclado_list = Signal(list)
-    macro_mouse_list = Signal(list)
+    """Canal de comunicação central para a UI."""
+    status_updated = Signal(str)
+    counter_updated = Signal(int)
+    macro_keyboard_updated = Signal(list)
+    macro_mouse_updated = Signal(list)
+    execution_finished = Signal()
 
+class GlobalListener(QObject):
+    """
+    Objeto que roda em uma thread separada para escutar todos os inputs globais.
+    Ele NUNCA interage com a UI diretamente, apenas emite sinais.
+    """
+    hotkey_pressed = Signal(str)  # Sinal principal para atalhos
+    key_pressed = Signal(object)
+    key_released = Signal(object)
+    mouse_event = Signal(str, tuple) # (event_type, data)
+
+    def __init__(self, hotkeys: Dict[str, str]):
+        super().__init__()
+        self.hotkeys = hotkeys
+        self.keyboard_listener = None
+        self.mouse_listener = None
+        self.ctrl_pressed = False
+        self.shift_pressed = False
+
+    def run(self):
+        """Inicia os listeners do pynput. Este método bloqueia até que os listeners parem."""
+        self.keyboard_listener = KeyboardListener(on_press=self._on_press, on_release=self._on_release)
+        self.mouse_listener = MouseListener(on_move=self._on_move, on_click=self._on_click, on_scroll=self._on_scroll)
+        self.keyboard_listener.start()
+        self.mouse_listener.start()
+        self.keyboard_listener.join()
+        self.mouse_listener.join()
+
+    def stop(self):
+        """Para os listeners de forma segura."""
+        if self.keyboard_listener:
+            self.keyboard_listener.stop()
+        if self.mouse_listener:
+            self.mouse_listener.stop()
+
+    def update_hotkeys(self, new_hotkeys: Dict[str, str]):
+        self.hotkeys = new_hotkeys
+
+    def _key_to_str(self, key):
+        if isinstance(key, Key):
+            return KEY_MAP_SAVE.get(key, f"Key.{key.name}")
+        if isinstance(key, KeyCode):
+            return key.char if key.char is not None else str(key)
+        return str(key)
+
+    # --- Callbacks do Pynput (Apenas emitem sinais) ---
+    def _on_press(self, key):
+        if key in (Key.ctrl_l, Key.ctrl_r): self.ctrl_pressed = True
+        if key in (Key.shift_l, Key.shift_r): self.shift_pressed = True
+        
+        key_name = self._key_to_str(key)
+        # Verifica se é um atalho
+        for hotkey_name, hotkey_value in self.hotkeys.items():
+            if key_name == hotkey_value:
+                self.hotkey_pressed.emit(hotkey_name)
+                return  # Se for um atalho, não processa como input de macro
+        
+        # Verifica captura de posição do mouse (Ctrl+Shift+C)
+        try:
+            cond_char = getattr(key, "char", None)
+            if self.ctrl_pressed and self.shift_pressed and cond_char == 'c':
+                 self.mouse_event.emit("capture_pos", tuple(MouseController().position))
+                 return
+        except Exception:
+            pass
+
+        self.key_pressed.emit(key)
+
+    def _on_release(self, key):
+        if key in (Key.ctrl_l, Key.ctrl_r): self.ctrl_pressed = False
+        if key in (Key.shift_l, Key.shift_r): self.shift_pressed = False
+        self.key_released.emit(key)
+
+    def _on_move(self, x, y):
+        self.mouse_event.emit("move", (x, y))
+
+    def _on_click(self, x, y, button, pressed):
+        if pressed:
+            self.mouse_event.emit("click", (x, y, button))
+
+    def _on_scroll(self, x, y, dx, dy):
+        self.mouse_event.emit("scroll", (x, y, dx, dy))
+
+# --- FIM DA ARQUITETURA REFEITA ---
+
+
+# Constantes e Globais
+PROFILES_FILE = "macro_profiles.json"
+SPECIAL_KEYS: Dict[str, Key] = {
+    "Espaço": Key.space, "Enter": Key.enter, "Shift": Key.shift,
+    "Ctrl": Key.ctrl, "Alt": Key.alt, "Tab": Key.tab,
+    "Backspace": Key.backspace, "Esc": Key.esc,
+}
+KEY_MAP_SAVE = {v: f"Key.{k.capitalize()}" for k, v in SPECIAL_KEYS.items()}
+KEY_MAP_LOAD = {v: k for k, v in KEY_MAP_SAVE.items()}
 bus = Bus()
 
-# ====== Estado global simples
-executando = False
-gravando = False
-gravando_mouse = False
-contador = 0
+# Variáveis globais para dados das macros (mais simples de manter assim por enquanto)
 macro_gravado_teclado: List[Tuple[Any, str, float]] = []
 macro_gravado_mouse: List[Tuple[Any, Any, float]] = []
 ultimo_tempo = 0.0
 
-# ====== Bus helpers
+
+# Funções Auxiliares
 def set_status(text: str):
-    bus.status.emit(text)
+    bus.status_updated.emit(text)
 
 def set_counter(value: int):
-    bus.counter.emit(value)
+    bus.counter_updated.emit(value)
 
-def set_macro_list_teclado(macro: List[Tuple[Any, str, float]]):
-    bus.macro_teclado_list.emit(macro)
+# O restante do seu código (Widgets, Páginas, etc.) começa aqui.
+# A maior parte dele permanece igual, as mudanças principais estão na MainWindow.
+# Colei todo o restante do código para garantir que tudo esteja no lugar.
 
-def set_macro_list_mouse(macro: List[Tuple[Any, Any, float]]):
-    bus.macro_mouse_list.emit(macro)
+# ====== WIDGET PARA CAPTURA DE IMAGEM ======
+class CaptureWidget(QWidget):
+    area_selecionada = Signal(tuple)
 
-# ====== Global listeners
-def start_global_listener(main_window):
-    global ultimo_tempo, macro_gravado_teclado, gravando, gravando_mouse
-    
-    ctrl_pressed = False
-    shift_pressed = False
-
-    def on_press_teclado(key):
-        nonlocal ctrl_pressed, shift_pressed
-        global gravando, ultimo_tempo, macro_gravado_teclado
-
-        if key == Key.ctrl_l or key == Key.ctrl_r:
-            ctrl_pressed = True
-        if key == Key.shift_l or key == Key.shift_r:
-            shift_pressed = True
-
-        try:
-            cond_char = getattr(key, "char", None)
-        except Exception:
-            cond_char = None
-        if ctrl_pressed and shift_pressed and cond_char == 'c':
-            main_window.capture_mouse_position()
-            return
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
-        key_name = main_window._key_to_str(key)
-        hotkey_gravar_teclado = main_window.hotkeys.get("gravar_macro_teclado")
-        hotkey_gravar_mouse = main_window.hotkeys.get("gravar_macro_mouse")
-        hotkey_parar_gravacao = main_window.hotkeys.get("parar_gravacao")
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
         
-        if key_name in (hotkey_gravar_teclado, hotkey_gravar_mouse, hotkey_parar_gravacao):
-            return
+        self.begin = None
+        self.end = None
+        self.setMouseTracking(True) 
 
-        if gravando:
-            if key == Key.esc:
-                main_window.stop_record_teclado()
-                return
-            agora = time.time()
-            atraso = agora - ultimo_tempo if ultimo_tempo != 0 else 0.0
-            macro_gravado_teclado.append((key, "press", atraso))
-            ultimo_tempo = agora
-            set_macro_list_teclado(macro_gravado_teclado)
-
-    def on_release_teclado(key):
-        nonlocal ctrl_pressed, shift_pressed
-        global gravando, ultimo_tempo, macro_gravado_teclado
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
         
-        key_name = main_window._key_to_str(key)
-        hotkey_gravar_teclado = main_window.hotkeys.get("gravar_macro_teclado")
-        hotkey_gravar_mouse = main_window.hotkeys.get("gravar_macro_mouse")
-        hotkey_parar_gravacao = main_window.hotkeys.get("parar_gravacao")
+        if self.begin and self.end:
+            painter.setPen(QPen(QColor(0, 255, 0, 200), 2, Qt.PenStyle.SolidLine))
+            painter.setBrush(QColor(0, 255, 0, 30))
+            rect = QRect(self.begin, self.end)
+            painter.drawRect(rect.normalized())
 
-        if key_name in (hotkey_gravar_teclado, hotkey_gravar_mouse, hotkey_parar_gravacao):
-            return
+    def mousePressEvent(self, event):
+        self.begin = event.pos()
+        self.end = self.begin
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        self.end = event.pos()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        rect = QRect(self.begin, self.end).normalized()
+        self.hide()
+        ponto_global = self.mapToGlobal(rect.topLeft())
+        self.area_selecionada.emit((ponto_global.x(), ponto_global.y(), rect.width(), rect.height()))
+        self.deleteLater()
         
-        if key == Key.ctrl_l or key == Key.ctrl_r:
-            ctrl_pressed = False
-        if key == Key.shift_l or key == Key.shift_r:
-            shift_pressed = False
-        
-        if gravando:
-            if key == Key.esc:
-                return
-            agora = time.time()
-            atraso = agora - ultimo_tempo
-            macro_gravado_teclado.append((key, "release", atraso))
-            ultimo_tempo = agora
-            set_macro_list_teclado(macro_gravado_teclado)
-    
-    def on_move_mouse(x, y):
-        global gravando_mouse, ultimo_tempo, macro_gravado_mouse
-        if gravando_mouse:
-            agora = time.time()
-            atraso = agora - ultimo_tempo
-            macro_gravado_mouse.append(("move", (x, y), atraso))
-            ultimo_tempo = agora
-            set_macro_list_mouse(macro_gravado_mouse)
-
-    def on_click_mouse(x, y, button, pressed):
-        if pressed:
-            if main_window.is_capturing_pixel:
-                main_window.add_pixel_wait_step(x, y, is_keyboard_macro=False)
-                return
-            if main_window.is_capturing_pixel_teclado:
-                main_window.add_pixel_wait_step(x, y, is_keyboard_macro=True)
-                return
-
-        global gravando_mouse, ultimo_tempo, macro_gravado_mouse
-        if gravando_mouse and pressed:
-            agora = time.time()
-            atraso = agora - ultimo_tempo
-            macro_gravado_mouse.append(("click", button, atraso))
-            ultimo_tempo = agora
-            set_macro_list_mouse(macro_gravado_mouse)
-
-    def on_scroll_mouse(x, y, dx, dy):
-        global gravando_mouse, ultimo_tempo, macro_gravado_mouse
-        if gravando_mouse:
-            agora = time.time()
-            atraso = agora - ultimo_tempo
-            direction = "para cima" if dy > 0 else "para baixo"
-            macro_gravado_mouse.append(("scroll", (direction, dy), atraso))
-            ultimo_tempo = agora
-            set_macro_list_mouse(macro_gravado_mouse)
-
-    def on_press_global(key):
-        global executando
-        try:
-            hotkeys = main_window.hotkeys
-            key_name = main_window._key_to_str(key)
-            
-            if key_name == hotkeys.get("autoclicker_teclado"):
-                if executando: main_window.stop_all()
-                else: main_window.start_auto_click_teclado()
-            elif key_name == hotkeys.get("autoclicker_mouse"):
-                if executando: main_window.stop_all()
-                else: threading.Thread(target=main_window.start_auto_click_mouse, daemon=True).start()
-            elif key_name == hotkeys.get("macro_teclado"):
-                if executando: main_window.stop_all()
-                else: threading.Thread(target=main_window.start_macro_teclado, daemon=True).start()
-            elif key_name == hotkeys.get("macro_mouse"):
-                if executando: main_window.stop_all()
-                else: threading.Thread(target=main_window.start_macro_mouse, daemon=True).start()
-            elif key_name == hotkeys.get("parar_tudo"):
-                main_window.stop_all()
-            elif key_name == hotkeys.get("gravar_macro_teclado"):
-                main_window.start_record_teclado()
-            elif key_name == hotkeys.get("gravar_macro_mouse"):
-                main_window.start_record_mouse()
-            elif key_name == hotkeys.get("parar_gravacao"):
-                main_window.stop_all()
-        except Exception:
-            pass
-
-    keyboard_listener = Listener(on_press=lambda k: [on_press_teclado(k), on_press_global(k)], on_release=on_release_teclado)
-    keyboard_listener.daemon = True
-    keyboard_listener.start()
-    
-    mouse_listener = MouseListener(on_move=on_move_mouse, on_click=on_click_mouse, on_scroll=on_scroll_mouse)
-    mouse_listener.daemon = True
-    mouse_listener.start()
-
-    return keyboard_listener, mouse_listener
-
 # ====== Páginas e Widgets (QWidgets) ======
 
 class OverlayWidget(QWidget):
@@ -453,7 +440,7 @@ class PageMacros(QWidget):
         row_teclado_play.addWidget(self.btn_clear_teclado)
         teclado_layout.addLayout(row_teclado_play)
         self.list_macro_teclado = QListWidget()
-        self.list_macro_teclado.setToolTip("Dê um clique duplo em um item para editar o seu delay.")
+        self.list_macro_teclado.setToolTip("Dê um clique duplo em um item para editar seus detalhes.")
         self.list_macro_teclado.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.list_macro_teclado.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list_macro_teclado.setDefaultDropAction(Qt.DropAction.MoveAction)
@@ -489,11 +476,25 @@ class PageMacros(QWidget):
         self.lbl_mouse_pos.setStyleSheet("color: #a0a0b0; font-size: 16px; font-weight: bold;")
         self.lbl_mouse_pos.setAlignment(Qt.AlignmentFlag.AlignCenter)
         mouse_layout.addWidget(self.lbl_mouse_pos)
+        
+        self.chk_relative_mouse = QCheckBox("Gravar movimentos relativos à janela ativa")
+        if PYWIN32_AVAILABLE:
+            self.chk_relative_mouse.setToolTip("Grava as coordenadas do mouse como uma distância a partir do canto da janela em foco.")
+        else:
+            self.chk_relative_mouse.setToolTip("Funcionalidade indisponível. Instale a biblioteca 'pywin32'.")
+            self.chk_relative_mouse.setEnabled(False)
+        mouse_layout.addWidget(self.chk_relative_mouse)
+        
         self.btn_capture_pixel = QPushButton("🎯 Capturar Pixel/Cor")
         self.btn_capture_pixel.setToolTip("Inicia o modo de captura. O próximo clique na tela irá adicionar um passo de 'Aguardar por Pixel' na macro de mouse.")
         mouse_layout.addWidget(self.btn_capture_pixel)
+
+        self.btn_capture_image = QPushButton("📸 Capturar Área/Imagem")
+        self.btn_capture_image.setToolTip("Inicia o modo de captura para selecionar uma área da tela (imagem).")
+        mouse_layout.addWidget(self.btn_capture_image)
+
         self.list_macro_mouse = QListWidget()
-        self.list_macro_mouse.setToolTip("Dê um clique duplo em um item para editar o seu delay.")
+        self.list_macro_mouse.setToolTip("Dê um clique duplo em um item para editar seus detalhes.")
         self.list_macro_mouse.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.list_macro_mouse.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list_macro_mouse.setDefaultDropAction(Qt.DropAction.MoveAction)
@@ -584,8 +585,9 @@ class PageMacros(QWidget):
             delay_str = f"{d:.4f}s" if d > 0.001 else "0.000s"
             line_text = f"{i+1:02d}: "
             
-            if action_type == "move":
-                line_text += f"Mover para ({value[0]}, {value[1]}) (Delay: {delay_str})"
+            if action_type == "move" or action_type == "position":
+                prefix = "Mover para" if action_type == "move" else "Pos. Fixa"
+                line_text += f"{prefix} ({value[0]}, {value[1]}) (Delay: {delay_str})"
             elif action_type == "click":
                 try:
                     btn = str(value).split('.')[-1].capitalize()
@@ -594,12 +596,16 @@ class PageMacros(QWidget):
                 line_text += f"Clique {btn} (Delay: {delay_str})"
             elif action_type == "scroll":
                 line_text += f"Rolagem {value[0]} (Delay: {delay_str})"
-            elif action_type == "position":
-                line_text += f"Pos. Fixa ({value[0]}, {value[1]})"
             elif action_type == "wait_pixel":
                 px, py, pcolor = value
                 line_text += f"Aguardar Pixel em ({px}, {py}) ser da cor {pcolor}"
-            
+            elif action_type == "wait_image":
+                line_text += f"Aguardar Imagem '{os.path.basename(value)}' (Delay: {delay_str})"
+            elif action_type == "click_image":
+                line_text += f"Clicar na Imagem '{os.path.basename(value)}' (Delay: {delay_str})"
+            elif action_type == "set_relative_origin":
+                line_text += f"Origem Relativa: Janela '{value}'"
+
             self.list_macro_mouse.addItem(line_text)
 
     def _toggle_reps(self, state):
@@ -740,12 +746,12 @@ class PageSettings(QWidget):
                 hotkey_name = self.current_hotkey_field.objectName().replace("input_", "")
                 if win := self.window():
                     win.hotkeys[hotkey_name] = key_str
-                    win.restart_global_listeners()
+                    win.listener.update_hotkeys(win.hotkeys) # ATUALIZA OS ATALHOS NO LISTENER
             finally:
                 self.stop_capture_hotkey()
                 return False
 
-        self.hotkey_listener = Listener(on_press=on_press)
+        self.hotkey_listener = KeyboardListener(on_press=on_press)
         self.hotkey_listener.start()
 
     def stop_capture_hotkey(self):
@@ -790,7 +796,7 @@ class PageAbout(QWidget):
         </ul>
         <hr style="border: 1px solid #3c3c52;">
         <p style="text-align: center; color: #7a7a7a;">
-            Versão 2.1<br>
+            Versão 3.0 (Refatorada)<br>
             Desenvolvido por Gabriel Alves da Silva Diógenes<br>
             Copyright © 2025
         </p>
@@ -801,9 +807,10 @@ class PageAbout(QWidget):
 
 # ====== Janela principal (integra tudo)
 class MainWindow(QMainWindow):
+    # --- PROPRIEDADES PRINCIPAIS ---
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Auto Clicker + Macro Dashboard (Qt)")
+        self.setWindowTitle("Auto Clicker + Macro Dashboard (v3 - Refatorado)")
         self.setMinimumSize(QSize(1200, 700))
         self.resize(1200, 700)
         try:
@@ -811,15 +818,37 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         
+        # --- ARQUITETURA REFEITA: INICIALIZAÇÃO ---
+        self.app_state = AppState.IDLE
         self.hotkeys = {}
-        self.keyboard_listener = None
-        self.mouse_listener = None
+        self.worker_thread = None
+        self.stop_event = threading.Event()
+
+        # Configura o listener para rodar em sua própria thread de forma segura
+        self.listener_thread = QThread()
+        self.listener = GlobalListener(self.hotkeys)
+        self.listener.moveToThread(self.listener_thread)
+        
+        # Conexões de sinais do listener
+        self.listener_thread.started.connect(self.listener.run)
+        self.listener.hotkey_pressed.connect(self.on_hotkey_pressed)
+        self.listener.key_pressed.connect(self.on_key_pressed_for_macro)
+        self.listener.key_released.connect(self.on_key_released_for_macro)
+        self.listener.mouse_event.connect(self.on_mouse_event_for_macro)
+        # --- FIM DA ARQUITETURA ---
+
         self.mouse_pos_timer = None
         self._current_animation = None
         self.current_total_reps = None
         self.is_capturing_pixel = False
         self.is_capturing_pixel_teclado = False
+        self.capture_widget = None
+        self.recording_origin = None
 
+        if not os.path.exists("captures"):
+            os.makedirs("captures")
+        
+        # --- Construção da UI (sem grandes mudanças aqui) ---
         sidebar = QFrame()
         sidebar.setFixedWidth(260)
         sidebar.setObjectName("sidebar")
@@ -903,31 +932,33 @@ class MainWindow(QMainWindow):
         root.addWidget(self.pages, 1)
         self.setCentralWidget(central)
 
-        # Cria e posiciona o widget de overlay
         self.overlay = OverlayWidget()
         screen_geometry = QScreen.availableGeometry(QApplication.primaryScreen())
         self.overlay.move(
             screen_geometry.width() - self.overlay.width() - 20,
             screen_geometry.height() - self.overlay.height() - 40
         )
+        # --- Fim da Construção da UI ---
 
+        # --- Conexões de Sinais e Slots ---
         self.btn_go_auto.clicked.connect(lambda: self.set_active_page(self.btn_go_auto, self.page_auto))
         self.btn_go_macro.clicked.connect(lambda: self.set_active_page(self.btn_go_macro, self.page_macro))
         self.btn_go_settings.clicked.connect(lambda: self.set_active_page(self.btn_go_settings, self.page_settings))
         self.btn_go_about.clicked.connect(lambda: self.set_active_page(self.btn_go_about, self.page_about))
         self.set_active_page(self.btn_go_auto, self.page_auto)
 
-        bus.status.connect(self.on_status)
-        bus.counter.connect(self.on_counter)
-        bus.macro_teclado_list.connect(self.page_macro.update_keyboard_macro_list)
-        bus.macro_mouse_list.connect(self.page_macro.update_mouse_macro_list)
+        bus.status_updated.connect(self.on_status)
+        bus.counter_updated.connect(self.on_counter)
+        bus.macro_keyboard_updated.connect(self.page_macro.update_keyboard_macro_list)
+        bus.macro_mouse_updated.connect(self.page_macro.update_mouse_macro_list)
+        bus.execution_finished.connect(self.on_execution_finished)
 
         self.page_auto.btn_start_keyboard_ac.clicked.connect(self.start_auto_click_teclado)
-        self.page_auto.btn_start_mouse_ac.clicked.connect(lambda: threading.Thread(target=self.start_auto_click_mouse, daemon=True).start())
+        self.page_auto.btn_start_mouse_ac.clicked.connect(self.start_auto_click_mouse)
         self.page_auto.btn_stop.clicked.connect(self.stop_all)
         self.page_macro.btn_rec_teclado.clicked.connect(self.start_record_teclado)
         self.page_macro.btn_stop_rec_teclado.clicked.connect(self.stop_record_teclado)
-        self.page_macro.btn_play_teclado.clicked.connect(lambda: threading.Thread(target=self.start_macro_teclado, daemon=True).start())
+        self.page_macro.btn_play_teclado.clicked.connect(self.start_macro_teclado)
         self.page_macro.btn_clear_teclado.clicked.connect(self.clear_current_macro_teclado)
         self.page_macro.btn_delete_step_teclado.clicked.connect(self.delete_keyboard_macro_step)
         self.page_macro.btn_duplicate_step_teclado.clicked.connect(self.duplicate_keyboard_macro_step)
@@ -939,7 +970,7 @@ class MainWindow(QMainWindow):
         )
         self.page_macro.btn_rec_mouse.clicked.connect(self.start_record_mouse)
         self.page_macro.btn_stop_rec_mouse.clicked.connect(self.stop_record_mouse)
-        self.page_macro.btn_play_mouse.clicked.connect(lambda: threading.Thread(target=self.start_macro_mouse, daemon=True).start())
+        self.page_macro.btn_play_mouse.clicked.connect(self.start_macro_mouse)
         self.page_macro.btn_clear_mouse.clicked.connect(self.clear_current_macro_mouse)
         self.page_macro.btn_delete_step_mouse.clicked.connect(self.delete_mouse_macro_step)
         self.page_macro.btn_duplicate_step_mouse.clicked.connect(self.duplicate_mouse_macro_step)
@@ -951,6 +982,7 @@ class MainWindow(QMainWindow):
         )
         self.page_macro.btn_capture_pixel.clicked.connect(self.start_pixel_capture_mouse)
         self.page_macro.btn_capture_pixel_teclado.clicked.connect(self.start_pixel_capture_teclado)
+        self.page_macro.btn_capture_image.clicked.connect(self.start_image_capture)
         
         self.page_settings.btn_profile_save.clicked.connect(self.save_profile)
         self.page_settings.btn_profile_load.clicked.connect(self.load_profile)
@@ -969,45 +1001,138 @@ class MainWindow(QMainWindow):
 
         self.set_default_hotkeys()
         self.load_profiles()
-            
         self.start_cursor_tracker()
         self.setup_tray_icon()
+        self.listener_thread.start() # Inicia a thread do listener
 
-        # Carrega os efeitos sonoros
+        # Carrega sons
         self.start_sound = QSoundEffect()
         self.start_sound.setSource(QUrl.fromLocalFile("start.wav"))
         self.start_sound.setVolume(0.8)
-
         self.stop_sound = QSoundEffect()
         self.stop_sound.setSource(QUrl.fromLocalFile("stop.wav"))
         self.stop_sound.setVolume(0.8)
 
-    def set_default_hotkeys(self):
-        """Define e aplica um conjunto de atalhos padrão para a primeira utilização."""
-        set_status("Nenhum perfil encontrado. Carregando atalhos padrão.")
+    # --- NOVO SLOT CENTRAL PARA GERENCIAR ATALHOS ---
+    def on_hotkey_pressed(self, hotkey_name: str):
+        """Este slot é o novo centro de controle para todos os atalhos."""
         
-        default_keys = {
-            "gravar_macro_teclado": Key.f1, "gravar_macro_mouse": Key.f2,
-            "parar_gravacao": Key.f5, "autoclicker_teclado": Key.f6,
-            "autoclicker_mouse": Key.f7, "macro_teclado": Key.f8,
-            "parar_tudo": Key.f9, "macro_mouse": Key.f10,
-        }
+        # Lógica para parar ações
+        is_stop_key = hotkey_name in ("parar_tudo", "parar_gravacao")
+        if self.app_state == AppState.EXECUTING and (is_stop_key or "autoclicker" in hotkey_name or "macro" in hotkey_name):
+            self.stop_all()
+            return
+        if (self.app_state == AppState.RECORDING_KEYBOARD or self.app_state == AppState.RECORDING_MOUSE) and is_stop_key:
+            self.stop_all()
+            return
 
-        for name, key_obj in default_keys.items():
-            key_str = self._key_to_str(key_obj)
-            self.hotkeys[name] = key_str
+        # Lógica para iniciar ações (só funciona se estiver ocioso)
+        if self.app_state == AppState.IDLE:
+            if hotkey_name == "autoclicker_teclado":
+                self.start_auto_click_teclado()
+            elif hotkey_name == "autoclicker_mouse":
+                self.start_auto_click_mouse()
+            elif hotkey_name == "macro_teclado":
+                self.start_macro_teclado()
+            elif hotkey_name == "macro_mouse":
+                self.start_macro_mouse()
+            elif hotkey_name == "gravar_macro_teclado":
+                self.start_record_teclado()
+            elif hotkey_name == "gravar_macro_mouse":
+                self.start_record_mouse()
+
+    # --- NOVOS SLOTS PARA GRAVAÇÃO DE MACRO ---
+    def on_key_pressed_for_macro(self, key):
+        global ultimo_tempo, macro_gravado_teclado
+        if self.app_state != AppState.RECORDING_KEYBOARD:
+            return
+        if key == Key.esc:
+            self.stop_record_teclado()
+            return
+        agora = time.time()
+        atraso = agora - ultimo_tempo if ultimo_tempo != 0 else 0.0
+        macro_gravado_teclado.append((key, "press", atraso))
+        ultimo_tempo = agora
+        bus.macro_keyboard_updated.emit(macro_gravado_teclado)
+
+    def on_key_released_for_macro(self, key):
+        global ultimo_tempo, macro_gravado_teclado
+        if self.app_state != AppState.RECORDING_KEYBOARD:
+            return
+        if key == Key.esc: return
+        agora = time.time()
+        atraso = agora - ultimo_tempo
+        macro_gravado_teclado.append((key, "release", atraso))
+        ultimo_tempo = agora
+        bus.macro_keyboard_updated.emit(macro_gravado_teclado)
+
+    def on_mouse_event_for_macro(self, event_type, data):
+        global ultimo_tempo, macro_gravado_mouse
+        
+        # Captura de pixel/posição
+        if event_type == "click":
+            x, y, button = data
+            if self.is_capturing_pixel:
+                self.add_pixel_wait_step(x, y, is_keyboard_macro=False)
+                return
+            if self.is_capturing_pixel_teclado:
+                self.add_pixel_wait_step(x, y, is_keyboard_macro=True)
+                return
+        elif event_type == "capture_pos":
+             x, y = data
+             macro_gravado_mouse.append(("position", (x, y), 0.0))
+             bus.macro_mouse_updated.emit(macro_gravado_mouse)
+             set_status(f"Posição ({x}, {y}) capturada.")
+             return
+
+        # Lógica de gravação de macro
+        if self.app_state != AppState.RECORDING_MOUSE:
+            return
+        
+        agora = time.time()
+        atraso = agora - ultimo_tempo if ultimo_tempo != 0 else 0.0
+        
+        if event_type == "move":
+            x, y = data
+            if self.recording_origin:
+                origin_x, origin_y = self.recording_origin
+                record_x, record_y = x - origin_x, y - origin_y
+            else:
+                record_x, record_y = x, y
+            macro_gravado_mouse.append(("move", (record_x, record_y), atraso))
+        
+        elif event_type == "click":
+            x, y, button = data
+            macro_gravado_mouse.append(("click", button, atraso))
+
+        elif event_type == "scroll":
+            x, y, dx, dy = data
+            direction = "para cima" if dy > 0 else "para baixo"
+            macro_gravado_mouse.append(("scroll", (direction, dy), atraso))
+
+        ultimo_tempo = agora
+        bus.macro_mouse_updated.emit(macro_gravado_mouse)
+
+    def set_default_hotkeys(self):
+        default_keys = {
+            "autoclicker_teclado": "Key.f6", "autoclicker_mouse": "Key.f7",
+            "macro_teclado": "Key.f8", "macro_mouse": "Key.f10",
+            "parar_tudo": "Key.f9", "gravar_macro_teclado": "Key.f1",
+            "gravar_macro_mouse": "Key.f2", "parar_gravacao": "Key.f5",
+        }
+        self.hotkeys.update(default_keys)
+        for name, key_str in self.hotkeys.items():
             if input_field := self.page_settings.findChild(QLineEdit, f"input_{name}"):
                 input_field.setText(key_str)
-        
-        self.restart_global_listeners()
+        if self.listener:
+            self.listener.update_hotkeys(self.hotkeys)
+        set_status("Atalhos padrão carregados.")
 
     def play_start_sound(self):
-        """Toca o som de início se a opção estiver habilitada."""
         if self.page_settings.chk_enable_sounds.isChecked() and self.start_sound.isLoaded():
             self.start_sound.play()
 
     def play_stop_sound(self):
-        """Toca o som de parada se a opção estiver habilitada."""
         if self.page_settings.chk_enable_sounds.isChecked() and self.stop_sound.isLoaded():
             self.stop_sound.play()
             
@@ -1020,34 +1145,30 @@ class MainWindow(QMainWindow):
         )
 
     def setup_tray_icon(self):
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            print("AVISO: Bandeja do sistema não disponível.")
-            return
+        if not QSystemTrayIcon.isSystemTrayAvailable(): return
         self.tray_icon = QSystemTrayIcon(self)
-        icon = QIcon("app.ico")
-        if icon.isNull():
-            print("AVISO: Ícone 'app.ico' não encontrado. Criando um ícone genérico.")
-            pixmap = QPixmap(32, 32)
-            pixmap.fill(Qt.transparent)
-            painter = QPainter(pixmap)
-            painter.setBrush(QColor("#b890ff"))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(4, 4, 24, 24)
-            painter.end()
+        try:
+            icon = QIcon("app.ico")
+        except:
+            pixmap = QPixmap(32, 32); pixmap.fill(Qt.transparent); painter = QPainter(pixmap)
+            painter.setBrush(QColor("#b890ff")); painter.setPen(Qt.NoPen); painter.drawEllipse(4, 4, 24, 24); painter.end()
             icon = QIcon(pixmap)
         self.tray_icon.setIcon(icon)
         tray_menu = QMenu()
-        show_action = QAction("Mostrar", self)
-        quit_action = QAction("Sair", self)
+        show_action = QAction("Mostrar", self); quit_action = QAction("Sair", self)
         show_action.triggered.connect(self.showNormal)
-        quit_action.triggered.connect(QApplication.instance().quit)
-        tray_menu.addAction(show_action)
-        tray_menu.addSeparator()
-        tray_menu.addAction(quit_action)
+        quit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(show_action); tray_menu.addSeparator(); tray_menu.addAction(quit_action)
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self.on_tray_icon_activated)
         self.tray_icon.show()
-        print("INFO: Ícone da bandeja do sistema configurado.")
+
+    def quit_application(self):
+        """Método seguro para fechar a aplicação."""
+        self.listener.stop()
+        self.listener_thread.quit()
+        self.listener_thread.wait()
+        QApplication.instance().quit()
 
     def on_tray_icon_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -1055,14 +1176,14 @@ class MainWindow(QMainWindow):
             self.activateWindow()
 
     def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        self.tray_icon.showMessage(
-            "Automator está em Execução",
-            "O aplicativo foi minimizado para a bandeja. Os atalhos continuam ativos.",
-            QSystemTrayIcon.MessageIcon.Information,
-            2000
-        )
+        if event.spontaneous(): # Garante que o evento venha do usuário
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "Automator está em Execução",
+                "O aplicativo foi minimizado para a bandeja. Os atalhos continuam ativos.",
+                QSystemTrayIcon.MessageIcon.Information, 2000
+            )
 
     def set_active_page(self, btn: QPushButton, page: QWidget):
         for b in self.nav_buttons: b.setChecked(False)
@@ -1072,21 +1193,11 @@ class MainWindow(QMainWindow):
             page.setGraphicsEffect(effect)
             self.pages.setCurrentWidget(page)
             anim = QPropertyAnimation(effect, b"opacity", self)
-            anim.setDuration(220)
-            anim.setStartValue(0.0)
-            anim.setEndValue(1.0)
+            anim.setDuration(220); anim.setStartValue(0.0); anim.setEndValue(1.0)
             anim.finished.connect(lambda: page.setGraphicsEffect(None))
             anim.start()
         except Exception:
             self.pages.setCurrentWidget(page)
-
-    def restart_global_listeners(self):
-        global gravando, gravando_mouse
-        gravando = gravando_mouse = False
-        if self.keyboard_listener: self.keyboard_listener.stop()
-        if self.mouse_listener: self.mouse_listener.stop()
-        self.keyboard_listener, self.mouse_listener = start_global_listener(self)
-        set_status("Listeners reiniciados.")
         
     def start_cursor_tracker(self):
         self.mouse_pos_timer = QTimer(self)
@@ -1098,58 +1209,82 @@ class MainWindow(QMainWindow):
         pos = QCursor.pos()
         self.page_macro.lbl_mouse_pos.setText(f"Posição atual: ({pos.x()}, {pos.y()})")
 
-    def capture_mouse_position(self):
-        global macro_gravado_mouse
-        pos = QCursor.pos()
-        macro_gravado_mouse.append(("position", (pos.x(), pos.y()), 0.0))
-        set_macro_list_mouse(macro_gravado_mouse)
-        set_status(f"Posição ({pos.x()}, {pos.y()}) capturada.")
-
     def start_pixel_capture_mouse(self):
-        """Inicia o modo de captura de pixel para a macro de MOUSE."""
-        self.is_capturing_pixel = True
-        self.hide()
-        set_status("MODO DE CAPTURA (MOUSE): Clique no pixel desejado...")
+        self.is_capturing_pixel = True; self.hide(); set_status("MODO DE CAPTURA (MOUSE): Clique no pixel desejado...")
 
     def start_pixel_capture_teclado(self):
-        """Inicia o modo de captura de pixel para a macro de TECLADO."""
-        self.is_capturing_pixel_teclado = True
+        self.is_capturing_pixel_teclado = True; self.hide(); set_status("MODO DE CAPTURA (TECLADO): Clique no pixel desejado...")
+        
+    def start_image_capture(self):
         self.hide()
-        set_status("MODO DE CAPTURA (TECLADO): Clique no pixel desejado...")
+        self.capture_widget = CaptureWidget()
+        self.capture_widget.area_selecionada.connect(self.add_image_macro_step)
+        QTimer.singleShot(50, self.capture_widget.show)
+        set_status("MODO DE CAPTURA: Clique e arraste para selecionar uma área.")
+
+    def add_image_macro_step(self, rect_coords):
+        """Captura a imagem da área selecionada e a adiciona na macro."""
+        global macro_gravado_mouse
+        x_log, y_log, w_log, h_log = rect_coords
+
+        if w_log == 0 or h_log == 0:
+            self.showNormal()
+            self.activateWindow()
+            set_status("Captura cancelada (área inválida).")
+            return
+    
+        ratio = self.screen().devicePixelRatio()
+        
+        # Converte as coordenadas lógicas para coordenadas físicas
+        x_phys = int(x_log * ratio)
+        y_phys = int(y_log * ratio)
+        w_phys = int(w_log * ratio)
+        h_phys = int(h_log * ratio)
+
+        # Usa as coordenadas físicas corrigidas para tirar o screenshot
+        screenshot = ImageGrab.grab(bbox=(x_phys, y_phys, x_phys + w_phys, y_phys + h_phys))
+        
+        # Salva a imagem com um nome único
+        timestamp = int(time.time() * 1000)
+        image_path = os.path.join("captures", f"capture_{timestamp}.png")
+        screenshot.save(image_path)
+
+        # Pergunta ao usuário qual ação adicionar
+        items = ["Aguardar esta imagem aparecer", "Clicar no centro desta imagem"]
+        item, ok = QInputDialog.getItem(self, "Ação de Macro de Imagem", 
+                                        "Qual passo você deseja adicionar?", items, 0, False)
+
+        if ok and item:
+            action_type = "wait_image" if "Aguardar" in item else "click_image"
+            macro_gravado_mouse.append((action_type, image_path, 0.0))
+            bus.macro_mouse_updated.emit(macro_gravado_mouse)
+            set_status(f"Passo '{item}' adicionado com a imagem '{os.path.basename(image_path)}'.")
+
+        self.showNormal()
+        self.activateWindow()
 
     def add_pixel_wait_step(self, x, y, is_keyboard_macro: bool = False):
-        """Pega a cor do pixel e adiciona à macro correta."""
         global macro_gravado_mouse, macro_gravado_teclado
-        
         pixel_color = ImageGrab.grab().getpixel((x, y))
-        
         if is_keyboard_macro:
             macro_gravado_teclado.append(('wait_pixel', (x, y, pixel_color), 0.0))
-            set_macro_list_teclado(macro_gravado_teclado)
+            bus.macro_keyboard_updated.emit(macro_gravado_teclado)
             self.is_capturing_pixel_teclado = False
         else:
             macro_gravado_mouse.append(('wait_pixel', (x, y, pixel_color), 0.0))
-            set_macro_list_mouse(macro_gravado_mouse)
+            bus.macro_mouse_updated.emit(macro_gravado_mouse)
             self.is_capturing_pixel = False
+        self.showNormal(); self.activateWindow(); set_status(f"Passo 'Aguardar por Pixel' adicionado.")
         
-        self.showNormal()
-        self.activateWindow()
-        set_status(f"Passo 'Aguardar por Pixel' adicionado.")
+    def _prepare_execution(self, is_macro: bool = False):
+        """Prepara a UI para uma nova execução."""
+        if is_macro:
+            infinite = self.page_macro.is_infinite()
+            reps = self.page_macro.get_reps()
+        else:
+            infinite = self.page_auto.is_infinite()
+            reps = self.page_auto.get_reps()
         
-    def start_auto_click_teclado(self):
-        global executando, contador
-        if executando: set_status("Já em execução."); return
-        keys = self.page_auto.get_selected_keys()
-        if not keys: set_status("Nenhuma tecla selecionada."); return
-        
-        self.play_start_sound()
-        self.show_overlay_message("Executando Auto Clicker...")
-        executando = True
-        contador = 0
-        set_counter(contador)
-        set_status("Executando Auto Clicker (Teclado)…")
-        infinite = self.page_auto.is_infinite()
-        reps = self.page_auto.get_reps()
         if not infinite:
             self.current_total_reps = reps
             self.progress.setVisible(True)
@@ -1158,396 +1293,400 @@ class MainWindow(QMainWindow):
             self.current_total_reps = None
             self.progress.setVisible(False)
         
+        set_counter(0)
+        self.stop_event.clear()
+        self.app_state = AppState.EXECUTING
+        self.play_start_sound()
+
+    def start_auto_click_teclado(self):
+        if self.app_state != AppState.IDLE: return
+        keys = self.page_auto.get_selected_keys()
+        if not keys: set_status("Nenhuma tecla selecionada."); return
+        self._prepare_execution()
+        set_status("Executando Auto Clicker (Teclado)…")
+        self.show_overlay_message("Executando Auto Clicker...")
+
         def worker():
-            global executando, contador
             delay_min = self.page_auto.get_delay()
             delay_max = self.page_auto.spin_speed_max.value()
             use_random = self.page_auto.chk_random_delay.isChecked()
+            reps = self.page_auto.get_reps() if not self.page_auto.is_infinite() else -1
+            counter = 0
+            
+            loop_range = range(reps) if reps != -1 else iter(int, 1)
             try:
-                loop_range = range(reps) if not infinite else iter(int, 1)
                 for _ in loop_range:
-                    if not executando: break
+                    if self.stop_event.is_set(): break
                     for t in keys:
-                        if not executando: break
-                        keyboard.press(t)
-                        keyboard.release(t)
+                        if self.stop_event.is_set(): break
+                        KeyboardController().press(t)
+                        KeyboardController().release(t)
                         time.sleep(0.01)
-                    contador += 1
-                    set_counter(contador)
-                    time.sleep(random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min)
+                    counter += 1
+                    set_counter(counter)
+                    delay = random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min
+                    time.sleep(delay)
             finally:
-                self.stop_all()
+                bus.execution_finished.emit() 
                 
-        threading.Thread(target=worker, daemon=True).start()
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
 
     def start_auto_click_mouse(self):
-        global executando, contador
-        if executando: set_status("Já em execução."); return
-        
-        self.play_start_sound()
-        self.show_overlay_message("Executando Auto Clicker...")
-        executando = True
-        contador = 0
-        set_counter(contador)
+        if self.app_state != AppState.IDLE: return
+        self._prepare_execution()
         set_status("Executando Auto Clicker (Mouse)…")
-        infinite = self.page_auto.is_infinite()
-        reps = self.page_auto.get_reps()
-        if not infinite:
-            self.current_total_reps = reps
-            self.progress.setVisible(True)
-            self.progress.setValue(0)
-        else:
-            self.current_total_reps = None
-            self.progress.setVisible(False)
+        self.show_overlay_message("Executando Auto Clicker...")
         
         def worker():
-            global executando, contador
             button = self.page_auto.get_mouse_button()
             delay_min = self.page_auto.get_delay()
             delay_max = self.page_auto.spin_speed_max.value()
             use_random = self.page_auto.chk_random_delay.isChecked()
+            reps = self.page_auto.get_reps() if not self.page_auto.is_infinite() else -1
+            counter = 0
+
+            loop_range = range(reps) if reps != -1 else iter(int, 1)
             try:
-                loop_range = range(reps) if not infinite else iter(int, 1)
                 for _ in loop_range:
-                    if not executando: break
-                    mouse.click(button)
-                    contador += 1
-                    set_counter(contador)
-                    time.sleep(random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min)
+                    if self.stop_event.is_set(): break
+                    MouseController().click(button)
+                    counter += 1
+                    set_counter(counter)
+                    delay = random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min
+                    time.sleep(delay)
             finally:
-                self.stop_all()
+                bus.execution_finished.emit() 
                 
-        threading.Thread(target=worker, daemon=True).start()
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
     
     def stop_all(self):
-        global executando, gravando, gravando_mouse
-        if executando or gravando or gravando_mouse:
-            self.play_stop_sound()
-        self.overlay.hide()
-        executando = gravando = gravando_mouse = False
-        self.current_total_reps = None
-        self.progress.setVisible(False)
-        set_status("Parado")
+        if self.app_state != AppState.IDLE:
+            set_status("Parando...")
+            self.stop_event.set() # Sinaliza para a thread de trabalho parar
+            # A transição de estado e limpeza da UI acontece em on_execution_finished
+            if self.app_state in (AppState.RECORDING_KEYBOARD, AppState.RECORDING_MOUSE):
+                 bus.execution_finished.emit() # Força a finalização se estiver gravando
 
-    def start_record_teclado(self):
-        global gravando, ultimo_tempo
-        if gravando: return
-        self.play_start_sound()
-        self.stop_all()
-        gravando = True
-        ultimo_tempo = time.time()
-        set_macro_list_teclado(macro_gravado_teclado)
-        self.show_overlay_message("Gravando Macro de Teclado...")
-        set_status("Gravando Macro (Teclado)... Pressione atalho para parar.")
-        
-    def stop_record_teclado(self):
-        global gravando
-        if not gravando: return
+    def on_execution_finished(self):
+        self.app_state = AppState.IDLE
         self.play_stop_sound()
         self.overlay.hide()
-        gravando = False
+        self.current_total_reps = None
+        self.progress.setVisible(False)
+        self.recording_origin = None
+        self.is_capturing_pixel = False
+        self.is_capturing_pixel_teclado = False
+        set_status("Pronto")
+
+    def start_record_teclado(self):
+        global ultimo_tempo
+        if self.app_state != AppState.IDLE: return
+        self.app_state = AppState.RECORDING_KEYBOARD
+        self.play_start_sound()
+        ultimo_tempo = time.time()
+        bus.macro_keyboard_updated.emit(macro_gravado_teclado)
+        self.show_overlay_message("Gravando Macro de Teclado...")
+        set_status("Gravando Macro (Teclado)...")
+        
+    def stop_record_teclado(self):
+        if self.app_state != AppState.RECORDING_KEYBOARD: return
+        self.app_state = AppState.IDLE # Transição de estado
+        bus.execution_finished.emit() # Usa o mesmo sinal para limpar a UI
         set_status("Gravação de Teclado encerrada.")
         
     def start_macro_teclado(self):
-        global executando, contador
-        if executando: return
+        if self.app_state != AppState.IDLE: return
         if not macro_gravado_teclado: set_status("Nenhuma macro de teclado gravada."); return
-        
-        self.play_start_sound()
-        self.show_overlay_message("Executando Macro de Teclado...")
-        executando = True
-        contador = 0
-        set_counter(contador)
+        self._prepare_execution(is_macro=True)
         set_status("Executando Macro (Teclado)…")
-        infinite = self.page_macro.is_infinite()
-        reps = self.page_macro.get_reps()
-        if not infinite:
-            self.current_total_reps = reps
-            self.progress.setVisible(True)
-            self.progress.setValue(0)
-        else:
-            self.current_total_reps = None
-            self.progress.setVisible(False)
+        self.show_overlay_message("Executando Macro de Teclado...")
         
         def worker():
-            global executando, contador
             delay_min = self.page_macro.get_delay()
             delay_max = self.page_macro.spin_macro_speed_max.value()
             use_random = self.page_macro.chk_macro_random_delay.isChecked()
+            reps = self.page_macro.get_reps() if not self.page_macro.is_infinite() else -1
+            counter = 0
+
+            loop_range = range(reps) if reps != -1 else iter(int, 1)
             try:
-                loop_range = range(reps) if not infinite else iter(int, 1)
                 for _ in loop_range:
-                    if not executando: break
+                    if self.stop_event.is_set(): break
                     for tecla, acao, tempo in macro_gravado_teclado:
-                        if not executando: break
+                        if self.stop_event.is_set(): break
                         
                         if tecla == 'wait_pixel':
-                            target_x, target_y, target_color = acao
-                            timeout = 30
-                            start_time = time.time()
-                            set_status(f"Aguardando pixel em ({target_x}, {target_y}) ser {target_color}...")
-                            
+                            target_x, target_y, target_color = acao; timeout = 30; start_time = time.time()
+                            set_status(f"Aguardando pixel em ({target_x}, {target_y})...")
                             while time.time() - start_time < timeout:
-                                if not executando: break
-                                try:
-                                    current_color = ImageGrab.grab().getpixel((target_x, target_y))
-                                    if current_color == target_color:
-                                        set_status("Pixel encontrado! Continuando macro...")
-                                        break
-                                except Exception: pass
+                                if self.stop_event.is_set(): break
+                                if ImageGrab.grab().getpixel((target_x, target_y)) == target_color:
+                                    set_status("Pixel encontrado!"); break
                                 time.sleep(0.2)
-                            else:
-                                set_status(f"TIMEOUT: Pixel não encontrado após {timeout}s. Parando.")
-                                executando = False
-                            
-                            if not executando: break
+                            else: set_status(f"TIMEOUT: Pixel não encontrado. Parando."); self.stop_event.set()
+                            if self.stop_event.is_set(): break
                             continue
 
                         time.sleep(tempo)
-                        if acao == "press": keyboard.press(tecla)
-                        elif acao == "release": keyboard.release(tecla)
+                        if acao == "press": KeyboardController().press(tecla)
+                        elif acao == "release": KeyboardController().release(tecla)
                     
-                    if not executando: break
-                    contador += 1
-                    set_counter(contador)
-                    time.sleep(random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min)
+                    if self.stop_event.is_set(): break
+                    counter += 1; set_counter(counter)
+                    delay = random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min
+                    time.sleep(delay)
             finally:
-                self.stop_all()
+                bus.execution_finished.emit()
                 
-        threading.Thread(target=worker, daemon=True).start()
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
 
     def clear_current_macro_teclado(self):
         global macro_gravado_teclado
-        macro_gravado_teclado.clear()
-        set_macro_list_teclado(macro_gravado_teclado)
+        macro_gravado_teclado.clear(); bus.macro_keyboard_updated.emit(macro_gravado_teclado)
         set_status("Macro de teclado atual limpa.")
     
     def delete_keyboard_macro_step(self):
-        """Deleta o passo atualmente selecionado na lista de macro de teclado."""
         global macro_gravado_teclado
         current_row = self.page_macro.list_macro_teclado.currentRow()
-        
-        if current_row == -1:
-            set_status("Nenhum passo selecionado para deletar.")
-            return
-
+        if current_row == -1: set_status("Nenhum passo selecionado para deletar."); return
         del macro_gravado_teclado[current_row]
-        set_macro_list_teclado(macro_gravado_teclado)
+        bus.macro_keyboard_updated.emit(macro_gravado_teclado)
         set_status(f"Passo {current_row + 1} deletado.")
 
     def duplicate_keyboard_macro_step(self):
-        """Duplica o passo atualmente selecionado na lista de macro de teclado."""
         global macro_gravado_teclado
         current_row = self.page_macro.list_macro_teclado.currentRow()
-        
-        if current_row == -1:
-            set_status("Nenhum passo selecionado para duplicar.")
-            return
-
+        if current_row == -1: set_status("Nenhum passo selecionado para duplicar."); return
         item_to_duplicate = macro_gravado_teclado[current_row]
         macro_gravado_teclado.insert(current_row + 1, item_to_duplicate)
-
-        set_macro_list_teclado(macro_gravado_teclado)
+        bus.macro_keyboard_updated.emit(macro_gravado_teclado)
         set_status(f"Passo {current_row + 1} duplicado.")
 
+    def _edit_step_delay(self, macro_list, row, is_mouse=False):
+        action_type, value, old_delay = macro_list[row]
+        new_delay, ok = QInputDialog.getDouble(self, "Editar Delay", "Novo delay (em segundos):", old_delay, 0, 100, 4)
+        if ok and new_delay >= 0:
+            macro_list[row] = (action_type, value, new_delay)
+            if is_mouse: bus.macro_mouse_updated.emit(macro_list)
+            else: bus.macro_keyboard_updated.emit(macro_list)
+            set_status(f"Delay do passo {row + 1} alterado para {new_delay:.4f}s.")
+
     def edit_keyboard_macro_step(self, item):
-        """Abre um diálogo para editar o delay de um passo da macro de teclado."""
         global macro_gravado_teclado
         row = self.page_macro.list_macro_teclado.row(item)
         if row == -1: return
+        key_obj, action, old_delay = macro_gravado_teclado[row]
+        if isinstance(key_obj, (Key, KeyCode)): self._edit_step_delay(macro_gravado_teclado, row, is_mouse=False)
+        else: QMessageBox.information(self, "Edição Não Suportada", "A edição de detalhes para este tipo de passo ainda não foi implementada.")
 
-        original_data = macro_gravado_teclado[row]
-        
-        if not isinstance(original_data[0], (Key, KeyCode)):
-            set_status("Não é possível editar o delay desta ação.")
-            return
+    def edit_mouse_macro_step(self, item):
+        row = self.page_macro.list_macro_mouse.row(item);
+        if row == -1: return
+        action_type, value, delay = macro_gravado_mouse[row]
+        if action_type in ("move", "position"): self._edit_mouse_coords(row, (action_type, value, delay))
+        elif action_type == "click": self._edit_mouse_click(row, (action_type, value, delay))
+        elif action_type == "scroll": self._edit_mouse_scroll(row, (action_type, value, delay))
+        elif action_type in ("wait_image", "click_image"): self._edit_step_delay(macro_gravado_mouse, row, is_mouse=True)
+        else: QMessageBox.information(self, "Edição Não Suportada", "A edição deste tipo de passo não é suportada.")
 
-        key_obj, action, old_delay = original_data
-        new_delay, ok = QInputDialog.getDouble(self, "Editar Delay", "Novo delay (em segundos):", old_delay, 0, 100, 4)
+    def _edit_mouse_coords(self, row, data):
+        action_type, (old_x, old_y), old_delay = data
+        choice, ok = QInputDialog.getItem(self, "Editar Passo de Movimento", "O que você deseja editar?", ["Coordenadas", "Delay"], 0, False)
+        if not ok: return
+        if choice == "Delay": self._edit_step_delay(macro_gravado_mouse, row, is_mouse=True)
+        elif choice == "Coordenadas":
+            new_coords_str, ok = QInputDialog.getText(self, "Editar Coordenadas", "Novas coordenadas (x, y):", QLineEdit.EchoMode.Normal, f"{old_x}, {old_y}")
+            if ok and new_coords_str:
+                try:
+                    parts = new_coords_str.split(','); new_x = int(parts[0].strip()); new_y = int(parts[1].strip())
+                    macro_gravado_mouse[row] = (action_type, (new_x, new_y), old_delay)
+                    bus.macro_mouse_updated.emit(macro_gravado_mouse); set_status(f"Coordenadas do passo {row + 1} alteradas.")
+                except: QMessageBox.warning(self, "Erro de Formato", "Insira no formato 'x, y'")
 
-        if ok and new_delay >= 0:
-            macro_gravado_teclado[row] = (key_obj, action, new_delay)
-            set_macro_list_teclado(macro_gravado_teclado)
-            set_status(f"Delay do passo {row + 1} alterado para {new_delay:.4f}s.")
+    def _edit_mouse_click(self, row, data):
+        action_type, old_button, old_delay = data
+        choice, ok = QInputDialog.getItem(self, "Editar Passo de Clique", "O que você deseja editar?", ["Botão do Mouse", "Delay"], 0, False)
+        if not ok: return
+        if choice == "Delay": self._edit_step_delay(macro_gravado_mouse, row, is_mouse=True)
+        elif choice == "Botão do Mouse":
+            items = ["Esquerdo", "Direito", "Meio"]; current_item = "Esquerdo"
+            if old_button == MouseButton.right: current_item = "Direito"
+            if old_button == MouseButton.middle: current_item = "Meio"
+            new_button_str, ok = QInputDialog.getItem(self, "Editar Botão", "Selecione o novo botão:", items, items.index(current_item), False)
+            if ok and new_button_str:
+                button_map = {"Esquerdo": MouseButton.left, "Direito": MouseButton.right, "Meio": MouseButton.middle}
+                macro_gravado_mouse[row] = (action_type, button_map[new_button_str], old_delay)
+                bus.macro_mouse_updated.emit(macro_gravado_mouse); set_status(f"Botão do passo {row + 1} alterado.")
+
+    def _edit_mouse_scroll(self, row, data):
+        action_type, (old_direction, old_dy), old_delay = data
+        choice, ok = QInputDialog.getItem(self, "Editar Passo de Rolagem", "O que você deseja editar?", ["Direção/Força", "Delay"], 0, False)
+        if not ok: return
+        if choice == "Delay": self._edit_step_delay(macro_gravado_mouse, row, is_mouse=True)
+        elif choice == "Direção/Força":
+            new_dy, ok = QInputDialog.getInt(self, "Editar Força da Rolagem", "Força (positivo=cima, negativo=baixo):", old_dy, -100, 100, 1)
+            if ok:
+                new_direction = "para cima" if new_dy > 0 else "para baixo"
+                macro_gravado_mouse[row] = (action_type, (new_direction, new_dy), old_delay)
+                bus.macro_mouse_updated.emit(macro_gravado_mouse); set_status(f"Rolagem do passo {row + 1} alterada.")
 
     def handle_macro_reorder(self, macro_list: list, source_start: int, source_end: int, dest_row: int, is_mouse: bool = False):
-        """Atualiza a ordem da lista de dados da macro após mover um ou mais itens."""
         count = source_end - source_start + 1
-        if source_start <= dest_row <= source_end + 1:
-            return
-
+        if source_start <= dest_row <= source_end + 1: return
         moved_items = [macro_list[i] for i in range(source_start, source_end + 1)]
-
-        for i in sorted(range(source_start, source_end + 1), reverse=True):
-            del macro_list[i]
-            
-        if dest_row > source_start:
-            dest_row -= count
-
-        for i, item in enumerate(moved_items):
-            macro_list.insert(dest_row + i, item)
-
-        if is_mouse:
-            set_macro_list_mouse(macro_list)
-        else:
-            set_macro_list_teclado(macro_list)
-        
+        for i in sorted(range(source_start, source_end + 1), reverse=True): del macro_list[i]
+        if dest_row > source_start: dest_row -= count
+        for i, item in enumerate(moved_items): macro_list.insert(dest_row + i, item)
+        if is_mouse: bus.macro_mouse_updated.emit(macro_list)
+        else: bus.macro_keyboard_updated.emit(macro_list)
         set_status("Ordem da macro atualizada.")
 
     def start_record_mouse(self):
-        global gravando_mouse, ultimo_tempo
-        if gravando_mouse: return
+        global ultimo_tempo, macro_gravado_mouse
+        if self.app_state != AppState.IDLE: return
+        self.app_state = AppState.RECORDING_MOUSE
         self.play_start_sound()
-        self.stop_all()
-        gravando_mouse = True
+        
+        self.recording_origin = None
+        if self.page_macro.chk_relative_mouse.isChecked():
+            if not PYWIN32_AVAILABLE: set_status("ERRO: pywin32 não instalado.")
+            else:
+                try:
+                    hwnd = win32gui.GetForegroundWindow(); title = win32gui.GetWindowText(hwnd); rect = win32gui.GetWindowRect(hwnd)
+                    if not title: set_status("AVISO: Janela sem título. Gravando em modo absoluto.")
+                    else:
+                        macro_gravado_mouse.append(('set_relative_origin', title, 0.0))
+                        self.recording_origin = (rect[0], rect[1])
+                        set_status(f"Gravação relativa à janela '{title}' iniciada.")
+                except Exception as e: set_status(f"Erro ao obter janela: {e}. Gravando em modo absoluto.")
+
         ultimo_tempo = time.time()
-        set_macro_list_mouse(macro_gravado_mouse)
+        bus.macro_mouse_updated.emit(macro_gravado_mouse)
         self.show_overlay_message("Gravando Macro de Mouse...")
-        set_status("Gravando Macro (Mouse)... Pressione atalho para parar.")
+        if not self.recording_origin: set_status("Gravando Macro (Mouse)...")
 
     def stop_record_mouse(self):
-        global gravando_mouse
-        if not gravando_mouse: return
-        self.play_stop_sound()
-        self.overlay.hide()
-        gravando_mouse = False
+        if self.app_state != AppState.RECORDING_MOUSE: return
+        self.app_state = AppState.IDLE
+        bus.execution_finished.emit()
         set_status("Gravação de Mouse encerrada.")
 
     def start_macro_mouse(self):
-        global executando, contador
-        if executando: return
+        if self.app_state != AppState.IDLE: return
         if not macro_gravado_mouse: set_status("Nenhuma macro de mouse gravada."); return
-        
-        self.play_start_sound()
-        self.show_overlay_message("Executando Macro de Mouse...")
-        executando = True
-        contador = 0
-        set_counter(contador)
+        self._prepare_execution(is_macro=True)
         set_status("Executando Macro (Mouse)…")
-        infinite = self.page_macro.is_infinite()
-        reps = self.page_macro.get_reps()
-        if not infinite:
-            self.current_total_reps = reps
-            self.progress.setVisible(True)
-            self.progress.setValue(0)
-        else:
-            self.current_total_reps = None
-            self.progress.setVisible(False)
+        self.show_overlay_message("Executando Macro de Mouse...")
         
         def worker():
-            global executando, contador
             delay_min = self.page_macro.get_delay()
             delay_max = self.page_macro.spin_macro_speed_max.value()
             use_random = self.page_macro.chk_macro_random_delay.isChecked()
+            reps = self.page_macro.get_reps() if not self.page_macro.is_infinite() else -1
+            counter = 0; playback_origin = (0, 0)
+            
+            loop_range = range(reps) if reps != -1 else iter(int, 1)
             try:
-                loop_range = range(reps) if not infinite else iter(int, 1)
                 for _ in loop_range:
-                    if not executando: break
+                    if self.stop_event.is_set(): break
                     for action_type, value, tempo in macro_gravado_mouse:
-                        if not executando: break
+                        if self.stop_event.is_set(): break
                         time.sleep(tempo)
 
-                        if action_type in ("move", "position"):
-                            mouse.position = value
+                        if action_type == 'set_relative_origin':
+                            window_title = value
+                            try:
+                                if not PYWIN32_AVAILABLE: raise ImportError("pywin32 não encontrado.")
+                                hwnd = win32gui.FindWindow(None, window_title)
+                                if hwnd == 0: set_status(f"ERRO: Janela '{window_title}' não encontrada."); self.stop_event.set()
+                                else: rect = win32gui.GetWindowRect(hwnd); playback_origin = (rect[0], rect[1]); set_status(f"Origem definida para '{window_title}'.")
+                            except Exception as e: set_status(f"Erro na janela relativa: {e}"); self.stop_event.set()
+                            continue
+                        
+                        elif action_type in ("move", "position"):
+                            origin_x, origin_y = playback_origin; rel_x, rel_y = value
+                            MouseController().position = (origin_x + rel_x, origin_y + rel_y)
                         elif action_type == "click":
-                            mouse.click(value)
+                            MouseController().click(value)
                         elif action_type == "scroll":
-                            mouse.scroll(0, value[1])
+                            MouseController().scroll(0, value[1])
                         elif action_type == 'wait_pixel':
-                            target_x, target_y, target_color = value
-                            timeout = 30
-                            start_time = time.time()
-                            set_status(f"Aguardando pixel em ({target_x}, {target_y}) ser {target_color}...")
-                            
+                            target_x, target_y, target_color = value; timeout = 30; start_time = time.time()
+                            set_status(f"Aguardando pixel em ({target_x}, {target_y})...")
                             while time.time() - start_time < timeout:
-                                if not executando: break
-                                try:
-                                    current_color = ImageGrab.grab().getpixel((target_x, target_y))
-                                    if current_color == target_color:
-                                        set_status("Pixel encontrado! Continuando macro...")
-                                        break
-                                except Exception:
-                                    pass
+                                if self.stop_event.is_set(): break
+                                if ImageGrab.grab().getpixel((target_x, target_y)) == target_color:
+                                    set_status("Pixel encontrado!"); break
                                 time.sleep(0.2)
-                            else:
-                                set_status(f"TIMEOUT: Pixel não encontrado após {timeout}s. Parando.")
-                                executando = False
+                            else: set_status(f"TIMEOUT: Pixel não encontrado. Parando."); self.stop_event.set()
+                        elif action_type in ("wait_image", "click_image"):
+                            try:
+                                template = cv2.imread(value, 0)
+                                w, h = template.shape[::-1]
+                                timeout = 30; start_time = time.time(); found = False
+                                set_status(f"Procurando por imagem '{os.path.basename(value)}'...")
+                                while time.time() - start_time < timeout:
+                                    if self.stop_event.is_set(): break
+                                    screen_gray = cv2.cvtColor(np.array(ImageGrab.grab()), cv2.COLOR_BGR2GRAY)
+                                    res = cv2.matchTemplate(screen_gray, template, cv2.TM_CCOEFF_NORMED)
+                                    loc = np.where(res >= 0.8)
+                                    if len(loc[0]) > 0:
+                                        found = True; set_status(f"Imagem encontrada!")
+                                        if action_type == "click_image":
+                                            pt = (loc[1][0], loc[0][0]); center_x = pt[0] + w // 2; center_y = pt[1] + h // 2
+                                            MouseController().position = (center_x, center_y); time.sleep(0.1)
+                                            MouseController().click(MouseButton.left)
+                                        break
+                                    time.sleep(0.5)
+                                if not found: set_status(f"TIMEOUT: Imagem não encontrada."); self.stop_event.set()
+                            except Exception as e: set_status(f"Erro no processamento de imagem: {e}"); self.stop_event.set()
                     
-                    if not executando: break
-                    contador += 1
-                    set_counter(contador)
-                    time.sleep(random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min)
+                    if self.stop_event.is_set(): break
+                    counter += 1; set_counter(counter)
+                    delay = random.uniform(delay_min, delay_max) if use_random and delay_max > delay_min else delay_min
+                    time.sleep(delay)
             finally:
-                self.stop_all()
+                bus.execution_finished.emit() 
                 
-        threading.Thread(target=worker, daemon=True).start()
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
         
     def clear_current_macro_mouse(self):
         global macro_gravado_mouse
-        macro_gravado_mouse.clear()
-        set_macro_list_mouse(macro_gravado_mouse)
+        macro_gravado_mouse.clear(); bus.macro_mouse_updated.emit(macro_gravado_mouse)
         set_status("Macro de mouse atual limpa.")
 
     def delete_mouse_macro_step(self):
-        """Deleta o passo atualmente selecionado na lista de macro de mouse."""
         global macro_gravado_mouse
         current_row = self.page_macro.list_macro_mouse.currentRow()
-        
-        if current_row == -1:
-            set_status("Nenhum passo selecionado para deletar.")
-            return
-
+        if current_row == -1: set_status("Nenhum passo selecionado para deletar."); return
         del macro_gravado_mouse[current_row]
-        set_macro_list_mouse(macro_gravado_mouse)
+        bus.macro_mouse_updated.emit(macro_gravado_mouse)
         set_status(f"Passo {current_row + 1} da macro de mouse deletado.")
         
     def duplicate_mouse_macro_step(self):
-        """Duplica o passo atualmente selecionado na lista de macro de mouse."""
         global macro_gravado_mouse
         current_row = self.page_macro.list_macro_mouse.currentRow()
-        
-        if current_row == -1:
-            set_status("Nenhum passo selecionado para duplicar.")
-            return
-
+        if current_row == -1: set_status("Nenhum passo selecionado para duplicar."); return
         item_to_duplicate = macro_gravado_mouse[current_row]
         macro_gravado_mouse.insert(current_row + 1, item_to_duplicate)
-
-        set_macro_list_mouse(macro_gravado_mouse)
+        bus.macro_mouse_updated.emit(macro_gravado_mouse)
         set_status(f"Passo {current_row + 1} da macro de mouse duplicado.")
-
-    def edit_mouse_macro_step(self, item):
-        """Abre um diálogo para editar o delay de um passo da macro de mouse."""
-        global macro_gravado_mouse
-        row = self.page_macro.list_macro_mouse.row(item)
-        if row == -1: return
-
-        original_data = macro_gravado_mouse[row]
-        action_type, value, old_delay = original_data
-        
-        if action_type in ("position", "wait_pixel"):
-            set_status("Não é possível editar o delay desta ação.")
-            return
-
-        new_delay, ok = QInputDialog.getDouble(self, "Editar Delay", "Novo delay (em segundos):", old_delay, 0, 100, 4)
-
-        if ok and new_delay >= 0:
-            macro_gravado_mouse[row] = (action_type, value, new_delay)
-            set_macro_list_mouse(macro_gravado_mouse)
-            set_status(f"Delay do passo {row + 1} (mouse) alterado para {new_delay:.4f}s.")
     
     def _key_to_str(self, key_obj: Any) -> str:
-        if isinstance(key_obj, Key):
-            return KEY_MAP_SAVE.get(key_obj, f"Key.{key_obj.name}")
-        if isinstance(key_obj, KeyCode):
-            return key_obj.char if key_obj.char is not None else str(key_obj)
+        if isinstance(key_obj, Key): return KEY_MAP_SAVE.get(key_obj, f"Key.{key_obj.name}")
+        if isinstance(key_obj, KeyCode): return key_obj.char if key_obj.char is not None else str(key_obj)
         return str(key_obj)
 
     def _str_to_key(self, key_str: str) -> Any:
+        if not isinstance(key_str, str): return key_str # Já é um objeto de tecla
         if key_str.startswith("Key."):
             try:
                 if mapped_key := KEY_MAP_LOAD.get(key_str): return mapped_key
-                return getattr(Key, key_str.split(".")[-1])
+                return getattr(Key, key_str.split(".")[-1].lower())
             except AttributeError: return None
         try: return KeyCode.from_char(key_str)
         except Exception: return None
@@ -1556,38 +1695,28 @@ class MainWindow(QMainWindow):
         return str(action) if isinstance(action, MouseButton) else action
         
     def get_all_settings_as_dict(self) -> Dict[str, Any]:
-        """Coleta todas as configurações da UI em um dicionário."""
         return {
             "autoclicker": self.page_auto.to_config(),
-            "macro_keyboard": [(self._key_to_str(k), a, d) for k, a, d in macro_gravado_teclado],
+            "macro_keyboard": [(self._key_to_str(k), a, d) if k != 'wait_pixel' else (k, a, d) for k, a, d in macro_gravado_teclado],
             "macro_mouse": [(a, self._mouse_action_to_str(v), d) for a, v, d in macro_gravado_mouse],
             "macro_settings": {
-                "infinite": self.page_macro.is_infinite(),
-                "reps": self.page_macro.get_reps(),
-                "delay": self.page_macro.get_delay(),
-                "random_delay": self.page_macro.chk_macro_random_delay.isChecked(),
+                "infinite": self.page_macro.is_infinite(), "reps": self.page_macro.get_reps(),
+                "delay": self.page_macro.get_delay(), "random_delay": self.page_macro.chk_macro_random_delay.isChecked(),
                 "random_delay_max": self.page_macro.spin_macro_speed_max.value()
             },
-            "hotkeys": {
-                "autoclicker_teclado": self.page_settings.input_ac_teclado.text(),
-                "autoclicker_mouse": self.page_settings.input_ac_mouse.text(),
-                "macro_teclado": self.page_settings.input_macro_teclado.text(),
-                "macro_mouse": self.page_settings.input_macro_mouse.text(),
-                "parar_tudo": self.page_settings.input_parar_tudo.text(),
-                "gravar_macro_teclado": self.page_settings.input_gravar_macro_teclado.text(),
-                "gravar_macro_mouse": self.page_settings.input_gravar_macro_mouse.text(),
-                "parar_gravacao": self.page_settings.input_parar_gravacao.text(),
-            },
+            "hotkeys": self.hotkeys,
             "enable_sounds": self.page_settings.chk_enable_sounds.isChecked()
         }
 
     def set_all_settings_from_dict(self, data: Dict[str, Any]):
-        """Aplica um dicionário de configurações a toda a UI."""
         global macro_gravado_teclado, macro_gravado_mouse
         self.page_auto.set_from_config(data.get("autoclicker", {}))
         
-        macro_gravado_teclado = [ (k_obj, a, d) for k_str, a, d in data.get("macro_keyboard", []) if (k_obj := self._str_to_key(k_str)) ]
-        set_macro_list_teclado(macro_gravado_teclado)
+        macro_gravado_teclado = []
+        for k_str, a, d in data.get("macro_keyboard", []):
+            if k_str == 'wait_pixel': macro_gravado_teclado.append((k_str, a, d))
+            else: k_obj = self._str_to_key(k_str); macro_gravado_teclado.append((k_obj, a, d))
+        bus.macro_keyboard_updated.emit(macro_gravado_teclado)
 
         macro_gravado_mouse = []
         for a, v, d in data.get("macro_mouse", []):
@@ -1596,7 +1725,7 @@ class MainWindow(QMainWindow):
                 try: val = getattr(MouseButton, v.split('.')[-1])
                 except Exception: pass
             macro_gravado_mouse.append((a, val, d))
-        set_macro_list_mouse(macro_gravado_mouse)
+        bus.macro_mouse_updated.emit(macro_gravado_mouse)
 
         macro_settings = data.get("macro_settings", {})
         self.page_macro.chk_macro_infinite.setChecked(macro_settings.get("infinite", True))
@@ -1606,118 +1735,90 @@ class MainWindow(QMainWindow):
         self.page_macro.spin_macro_speed_max.setValue(macro_settings.get("random_delay_max", 1.0))
         
         self.hotkeys = data.get("hotkeys", {})
+        self.listener.update_hotkeys(self.hotkeys)
         for name, value in self.hotkeys.items():
-            if inp := self.page_settings.findChild(QLineEdit, f"input_{name}"):
-                inp.setText(value)
+            if inp := self.page_settings.findChild(QLineEdit, f"input_{name}"): inp.setText(value)
         
         self.page_settings.chk_enable_sounds.setChecked(data.get("enable_sounds", True))
 
     def load_profiles(self):
-        """Carrega todos os perfis do arquivo JSON para a memória."""
         if os.path.exists(PROFILES_FILE):
             try:
-                with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-                    self._profiles = json.load(f)
-            except (json.JSONDecodeError, ValueError) as e:
-                QMessageBox.warning(self, "Erro de Perfis", f"Arquivo de perfis corrompido: {e}")
-                self._profiles = {}
-        else:
-            self._profiles = {}
+                with open(PROFILES_FILE, "r", encoding="utf-8") as f: self._profiles = json.load(f)
+            except: self._profiles = {}
+        else: self._profiles = {}
         self.page_settings.refresh_profiles(self._profiles)
 
     def save_profile(self):
-        """Salva o estado atual da aplicação como um novo perfil."""
         name = self.page_settings.input_profile_name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Salvar Perfil", "Por favor, informe um nome para o perfil.")
-            return
+        if not name: QMessageBox.warning(self, "Salvar Perfil", "Informe um nome."); return
         self._profiles[name] = self.get_all_settings_as_dict()
         try:
-            with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._profiles, f, ensure_ascii=False, indent=4)
-            set_status(f"Perfil '{name}' salvo com sucesso.")
-            self.page_settings.refresh_profiles(self._profiles)
-        except Exception as e:
-            QMessageBox.critical(self, "Erro ao Salvar", f"Não foi possível salvar o perfil: {e}")
+            with open(PROFILES_FILE, "w", encoding="utf-8") as f: json.dump(self._profiles, f, ensure_ascii=False, indent=4)
+            set_status(f"Perfil '{name}' salvo."); self.page_settings.refresh_profiles(self._profiles)
+        except Exception as e: QMessageBox.critical(self, "Erro ao Salvar", f"Não foi possível salvar: {e}")
 
     def load_profile(self):
-        """Carrega um perfil selecionado e aplica suas configurações."""
         name = self.page_settings.combo_profiles.currentText()
-        if not name or name not in self._profiles:
-            set_status("Nenhum perfil válido selecionado."); return
+        if not name or name not in self._profiles: set_status("Nenhum perfil válido selecionado."); return
         self.set_all_settings_from_dict(self._profiles[name])
-        self.restart_global_listeners()
         set_status(f"Perfil '{name}' carregado.")
 
     def delete_profile(self):
-        """Exclui o perfil selecionado."""
         name = self.page_settings.combo_profiles.currentText()
-        if not name or name not in self._profiles:
-            set_status("Nenhum perfil para excluir."); return
-        reply = QMessageBox.question(self, "Excluir Perfil", f"Tem certeza que deseja excluir o perfil '{name}'?",
+        if not name or name not in self._profiles: set_status("Nenhum perfil para excluir."); return
+        reply = QMessageBox.question(self, "Excluir Perfil", f"Tem certeza que deseja excluir '{name}'?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             del self._profiles[name]
             try:
-                with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                    json.dump(self._profiles, f, ensure_ascii=False, indent=4)
-                set_status(f"Perfil '{name}' excluído.")
-                self.page_settings.refresh_profiles(self._profiles)
-            except Exception as e:
-                QMessageBox.critical(self, "Erro ao Excluir", f"Não foi possível salvar as alterações: {e}")
+                with open(PROFILES_FILE, "w", encoding="utf-8") as f: json.dump(self._profiles, f, ensure_ascii=False, indent=4)
+                set_status(f"Perfil '{name}' excluído."); self.page_settings.refresh_profiles(self._profiles)
+            except Exception as e: QMessageBox.critical(self, "Erro ao Excluir", f"Não foi possível salvar: {e}")
 
     def export_profiles(self):
-        if not self._profiles:
-            QMessageBox.information(self, "Exportar Perfis", "Não há perfis para exportar."); return
+        if not self._profiles: QMessageBox.information(self, "Exportar", "Não há perfis para exportar."); return
         path, _ = QFileDialog.getSaveFileName(self, "Exportar Perfis", "perfis.json", "JSON (*.json)")
         if not path: return
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._profiles, f, ensure_ascii=False, indent=4)
+            with open(path, "w", encoding="utf-8") as f: json.dump(self._profiles, f, ensure_ascii=False, indent=4)
             set_status(f"Perfis exportados para: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Erro de Exportação", f"Erro ao exportar: {e}")
+        except Exception as e: QMessageBox.critical(self, "Erro de Exportação", f"Erro: {e}")
 
     def import_profiles(self):
         path, _ = QFileDialog.getOpenFileName(self, "Importar Perfis", "", "JSON (*.json)")
         if not path: return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data_from_file = json.load(f)
+            with open(path, "r", encoding="utf-8") as f: data_from_file = json.load(f)
             if not isinstance(data_from_file, dict): raise ValueError("Estrutura inválida.")
             self._profiles.update(data_from_file)
-            with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._profiles, f, ensure_ascii=False, indent=4)
-            self.page_settings.refresh_profiles(self._profiles)
-            set_status("Perfis importados.")
-        except Exception as e:
-            QMessageBox.critical(self, "Importar Perfis", f"Erro ao importar: {e}")
+            with open(PROFILES_FILE, "w", encoding="utf-8") as f: json.dump(self._profiles, f, ensure_ascii=False, indent=4)
+            self.page_settings.refresh_profiles(self._profiles); set_status("Perfis importados.")
+        except Exception as e: QMessageBox.critical(self, "Erro de Importação", f"Erro: {e}")
 
     def on_status(self, text: str):
         self.lbl_status.setText(f"Status: {text}")
         self.status_badge.setToolTip(f"Status: {text}")
         lower = text.lower()
-        if "executando" in lower or "gravando" in lower:
-            self.status_badge.setStyleSheet("background: qlineargradient(x1:0 y1:0, x2:1 y2:1, stop:0 #39d353, stop:1 #22a844); border-radius: 7px;")
-        elif "pronto" in lower or "parado" in lower:
-            self.status_badge.setStyleSheet("background: #6b6b7a; border-radius: 7px;")
-        elif "erro" in lower or "não" in lower:
-            self.status_badge.setStyleSheet("background: qlineargradient(x1:0 y1:0, x2:1 y2:1, stop:0 #ff5f56, stop:1 #d6453a); border-radius: 7px;")
-        else:
-            self.status_badge.setStyleSheet("background: #6b6b7a; border-radius: 7px;")
+        if "executando" in lower or "gravando" in lower: self.status_badge.setStyleSheet("background: #39d353; border-radius: 7px;")
+        elif "pronto" in lower or "parado" in lower: self.status_badge.setStyleSheet("background: #6b6b7a; border-radius: 7px;")
+        elif "erro" in lower or "não" in lower: self.status_badge.setStyleSheet("background: #ff5f56; border-radius: 7px;")
+        else: self.status_badge.setStyleSheet("background: #6b6b7a; border-radius: 7px;")
 
     def on_counter(self, value: int):
         self.lbl_counter.setText(f"Repetições: {value}")
         if self.current_total_reps:
-            try:
-                pct = int(min(100, (value / self.current_total_reps) * 100))
-                self.progress.setValue(pct)
-            except (ZeroDivisionError, TypeError):
-                self.progress.setValue(0)
+            try: self.progress.setValue(int(min(100, (value / self.current_total_reps) * 100)))
+            except: self.progress.setValue(0)
 
 # ====== Execução
 def main():
     app = QApplication(sys.argv)
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except:
+        try: ctypes.windll.user32.SetProcessDPIAware()
+        except: print("AVISO: Não foi possível definir o DPI awareness.")
     
     app.setStyleSheet("""
 * {
