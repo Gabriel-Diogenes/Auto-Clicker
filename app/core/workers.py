@@ -20,6 +20,7 @@ import numpy as np
 
 # Importa o bus para comunicação
 from app.core.bus import bus
+from app.utils import constants
 
 # Import pywin32 de forma segura para evitar erros caso não esteja instalado
 try:
@@ -270,3 +271,107 @@ class MouseMacroWorker(BaseWorker):
         except Exception as e:
             bus.status_updated.emit(f"Erro no processamento de imagem: {e}")
             self.stop_event.set()
+
+class BotWorker(threading.Thread):
+    """
+    Worker de alta performance para o Criador de Bots.
+    Ele roda em um loop contínuo e rápido, analisando a tela em busca de alvos.
+    """
+    def __init__(self, bot_config, stop_event):
+        super().__init__(daemon=True)
+        self.config = bot_config
+        self.stop_event = stop_event
+        self.roi = bot_config.get("roi")
+        self.targets = bot_config.get("targets", [])
+        self.rules = bot_config.get("rules", [])
+        
+        self.mouse = MouseController()
+        self.keyboard = KeyboardController()
+
+        # Pré-carrega as imagens dos alvos para otimização
+        self.image_templates = {}
+        for target in self.targets:
+            if target['type'] == 'image':
+                try:
+                    # Carrega em escala de cinza (0) para uma busca mais rápida
+                    template = cv2.imread(target['path'], 0)
+                    self.image_templates[target['name']] = template
+                except Exception as e:
+                    print(f"Erro ao carregar imagem do alvo '{target['name']}': {e}")
+
+    def run(self):
+        """O loop principal e de alta velocidade do bot."""
+        try:
+            while not self.stop_event.is_set():
+                # 1. Captura a Área de Interesse (ROI)
+                # O bbox é (left, top, right, bottom)
+                bbox = (self.roi[0], self.roi[1], self.roi[0] + self.roi[2], self.roi[1] + self.roi[3])
+                screen_pil = ImageGrab.grab(bbox=bbox)
+                screen_np = np.array(screen_pil)
+                screen_gray = cv2.cvtColor(screen_np, cv2.COLOR_BGR2GRAY)
+
+                # Dicionário para armazenar todos os alvos encontrados neste frame
+                found_targets = {}
+
+                # 2. Procura por todos os alvos de IMAGEM
+                for name, template in self.image_templates.items():
+                    w, h = template.shape[::-1]
+                    res = cv2.matchTemplate(screen_gray, template, cv2.TM_CCOEFF_NORMED)
+                    
+                    # Encontra todas as ocorrências com confiança acima de 80%
+                    locations = np.where(res >= 0.8)
+                    for pt in zip(*locations[::-1]): # pt é (x, y) do canto superior esquerdo
+                        # Converte a coordenada local do ROI para a coordenada global da tela
+                        global_x = self.roi[0] + pt[0] + w // 2
+                        global_y = self.roi[1] + pt[1] + h // 2
+                        if name not in found_targets:
+                            found_targets[name] = []
+                        found_targets[name].append((global_x, global_y))
+
+                # (Aqui entraria a lógica para procurar alvos de COR, se desejado)
+
+                # 3. Executa as regras para os alvos encontrados
+                if found_targets:
+                    for rule in self.rules:
+                        target_name = rule["target_name"]
+                        if target_name in found_targets:
+                            # Executa a ação para cada ocorrência encontrada do alvo
+                            for coords in found_targets[target_name]:
+                                self._execute_rule_action(rule, coords)
+        finally:
+            bus.execution_finished.emit()
+
+    def _execute_rule_action(self, rule, coords):
+        """Executa a ação definida em uma regra."""
+        action_name = rule["action_name"]
+        action_value = rule["action_value"]
+        x, y = coords
+
+        if action_name == "Clique Esquerdo":
+            self.mouse.position = (x, y)
+            time.sleep(0.01) # Pequena pausa para o mouse assentar
+            self.mouse.click(MouseButton.left)
+        elif action_name == "Clique Direito":
+            self.mouse.position = (x, y)
+            time.sleep(0.01)
+            self.mouse.click(MouseButton.right)
+        elif action_name == "Pressionar Tecla":
+            # Extrai as listas de teclas normais e especiais do dicionário
+            normal_keys = action_value.get('normal', [])
+            special_keys_str = action_value.get('special', [])
+
+            # Converte os nomes das teclas especiais (ex: "Espaço") para objetos de tecla reais (ex: Key.space)
+            special_keys_obj = [constants.SPECIAL_KEYS[k] for k in special_keys_str if k in constants.SPECIAL_KEYS]
+
+            all_keys = special_keys_obj + normal_keys
+
+            # Pressiona todas as teclas (primeiro as especiais, depois as normais)
+            for key in all_keys:
+                self.keyboard.press(key)
+
+            # Aguarda um instante minúsculo
+            time.sleep(0.05)
+
+            # Solta todas as teclas na ordem inversa para funcionar com modificadores (Ctrl, Shift, etc.)
+            for key in reversed(all_keys):
+                self.keyboard.release(key)

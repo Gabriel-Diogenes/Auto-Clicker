@@ -14,13 +14,13 @@ from pynput.keyboard import Key, KeyCode, Listener as KeyboardListener
 from pynput.mouse import Button as MouseButton
 
 # Imports do PySide6
-from PySide6.QtCore import Qt, QSize, QUrl, QThread, QPropertyAnimation, QTimer
+from PySide6.QtCore import Qt, QSize, QUrl, QThread, QPropertyAnimation, QTimer, QEvent
 from PySide6.QtGui import QIcon, QCursor, QAction, QPixmap, QPainter, QColor, QScreen
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QStackedWidget, QFrame, QMessageBox, QFileDialog, QProgressBar, QSizePolicy,
-    QGraphicsOpacityEffect, QMenu, QSystemTrayIcon, QInputDialog, QLineEdit
+    QGraphicsOpacityEffect, QMenu, QSystemTrayIcon, QInputDialog, QLineEdit, QDialog
 )
 from PIL import ImageGrab
 
@@ -33,10 +33,17 @@ from app.core.workers import (
     KeyboardMacroWorker, MouseMacroWorker
 )
 
+from app.core.workers import (
+    KeyboardAutoClickerWorker, MouseAutoClickerWorker,
+    KeyboardMacroWorker, MouseMacroWorker, BotWorker # <-- ADICIONE BotWorker AQUI
+)
+
 from app.ui.pages.page_autoclickers import PageAutoClickers
 from app.ui.pages.page_macros import PageMacros
+from app.ui.pages.page_bot_creator import PageBotCreator 
 from app.ui.pages.page_settings import PageSettings
 from app.ui.pages.page_about import PageAbout
+from app.ui.dialogs.rule_dialog import RuleDialog
 from app.ui.widgets.overlay_widget import OverlayWidget
 from app.ui.widgets.capture_widget import CaptureWidget
 
@@ -47,6 +54,7 @@ from app.utils import constants, profile_manager
 class MainWindow(QMainWindow):
     # --- PROPRIEDADES PRINCIPAIS ---
     def __init__(self):
+        self.listener = None
         super().__init__()
         self.setWindowTitle("Auto Clicker + Macro Dashboard (v3 - Refatorado)")
         self.setMinimumSize(QSize(1200, 700))
@@ -72,6 +80,7 @@ class MainWindow(QMainWindow):
         self._profiles = {}
 
         # Configura o listener para rodar em sua própria thread de forma segura
+        self.listener_paused_by_focus = False
         self.listener_thread = QThread()
         self.listener = GlobalListener(self.hotkeys)
         self.listener.moveToThread(self.listener_thread)
@@ -89,8 +98,14 @@ class MainWindow(QMainWindow):
         self.current_total_reps = None
         self.is_capturing_pixel = False
         self.is_capturing_pixel_teclado = False
+        self.is_capturing_bot_color = False
         self.capture_widget = None
         self.recording_origin = None
+        self.bot_config = {
+            "roi": None,      
+            "targets": [],    
+            "rules": []       
+        }
 
         if not os.path.exists("captures"):
             os.makedirs("captures")
@@ -114,6 +129,7 @@ class MainWindow(QMainWindow):
 
         icon_auto = get_icon_try(["fa.mouse-pointer", "fa5s.mouse-pointer", "fa.rocket"])
         icon_macro = get_icon_try(["fa.keyboard-o", "fa5s.keyboard", "fa.keyboard"])
+        icon_bot = get_icon_try(["fa.robot", "fa5s.robot"]) 
         icon_settings = get_icon_try(["fa.cog", "fa5s.cog"])
         icon_about = get_icon_try(["fa.info-circle", "fa5s.info-circle"])
         
@@ -121,11 +137,13 @@ class MainWindow(QMainWindow):
         if icon_auto: self.btn_go_auto.setIcon(icon_auto)
         self.btn_go_macro = QPushButton("  Macros")
         if icon_macro: self.btn_go_macro.setIcon(icon_macro)
+        self.btn_go_bot = QPushButton("  Criador de Bots")
+        if icon_bot: self.btn_go_bot.setIcon(icon_bot)
         self.btn_go_settings = QPushButton("  Configurações")
         if icon_settings: self.btn_go_settings.setIcon(icon_settings)
         self.btn_go_about = QPushButton("  Sobre")
         if icon_about: self.btn_go_about.setIcon(icon_about)
-        self.nav_buttons = [self.btn_go_auto, self.btn_go_macro, self.btn_go_settings, self.btn_go_about]
+        self.nav_buttons = [self.btn_go_auto, self.btn_go_macro, self.btn_go_bot, self.btn_go_settings, self.btn_go_about]
         for b in self.nav_buttons:
             b.setObjectName("navButton")
             b.setCheckable(True)
@@ -165,10 +183,12 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.page_auto = PageAutoClickers()
         self.page_macro = PageMacros()
+        self.page_bot = PageBotCreator()
         self.page_settings = PageSettings()
         self.page_about = PageAbout()
         self.pages.addWidget(self.page_auto)
         self.pages.addWidget(self.page_macro)
+        self.pages.addWidget(self.page_bot)
         self.pages.addWidget(self.page_settings)
         self.pages.addWidget(self.page_about)
 
@@ -190,6 +210,7 @@ class MainWindow(QMainWindow):
         # --- Conexões de Sinais e Slots ---
         self.btn_go_auto.clicked.connect(lambda: self.set_active_page(self.btn_go_auto, self.page_auto))
         self.btn_go_macro.clicked.connect(lambda: self.set_active_page(self.btn_go_macro, self.page_macro))
+        self.btn_go_bot.clicked.connect(lambda: self.set_active_page(self.btn_go_bot, self.page_bot))
         self.btn_go_settings.clicked.connect(lambda: self.set_active_page(self.btn_go_settings, self.page_settings))
         self.btn_go_about.clicked.connect(lambda: self.set_active_page(self.btn_go_about, self.page_about))
         self.set_active_page(self.btn_go_auto, self.page_auto)
@@ -237,36 +258,132 @@ class MainWindow(QMainWindow):
         self.page_settings.btn_export_profiles.clicked.connect(self.export_profiles)
         self.page_settings.btn_import_profiles.clicked.connect(self.import_profiles)
         
-        self.page_settings.input_ac_teclado.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_ac_teclado)
-        self.page_settings.input_ac_mouse.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_ac_mouse)
-        self.page_settings.input_macro_teclado.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_macro_teclado)
-        self.page_settings.input_macro_mouse.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_macro_mouse)
-        self.page_settings.input_parar_tudo.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_parar_tudo)
-        self.page_settings.input_gravar_macro_teclado.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_gravar_macro_teclado)
-        self.page_settings.input_gravar_macro_mouse.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_gravar_macro_mouse)
-        self.page_settings.input_parar_gravacao.mousePressEvent = lambda e: self.page_settings.start_capture_hotkey(self.page_settings.input_parar_gravacao)
+        self.page_settings.input_ac_teclado.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_ac_teclado)
+        self.page_settings.input_ac_mouse.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_ac_mouse)
+        self.page_settings.input_macro_teclado.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_macro_teclado)
+        self.page_settings.input_macro_mouse.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_macro_mouse)
+        self.page_settings.input_parar_tudo.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_parar_tudo)
+        self.page_settings.input_gravar_macro_teclado.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_gravar_macro_teclado)
+        self.page_settings.input_gravar_macro_mouse.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_gravar_macro_mouse)
+        self.page_settings.input_parar_gravacao.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_parar_gravacao)
+        self.page_settings.input_iniciar_bot.mousePressEvent = lambda e: self.start_hotkey_capture_mode(self.page_settings.input_iniciar_bot)
+
+        self.page_bot.btn_definir_area.clicked.connect(self.handle_bot_roi_request)
+        self.page_bot.btn_add_alvo_img.clicked.connect(self.handle_bot_add_image_target)
+        self.page_bot.btn_add_alvo_cor.clicked.connect(self.handle_bot_add_color_target)
+        self.page_bot.btn_add_regra.clicked.connect(self.handle_bot_add_rule)
+        self.page_bot.btn_remover_alvo.clicked.connect(self.handle_bot_remove_target)
+        self.page_bot.btn_remover_regra.clicked.connect(self.handle_bot_remove_rule)
+        self.page_bot.btn_iniciar_bot.clicked.connect(self.start_bot)
+        self.page_bot.btn_parar_bot.clicked.connect(self.stop_all)
+        self.page_settings.hotkey_updated.connect(self.on_hotkey_changed)
 
         self.set_default_hotkeys()
         self.load_profiles()
         self.start_cursor_tracker()
         self.setup_tray_icon()
-        self.listener_thread.start() # Inicia a thread do listener
+        self.listener_thread.start()
 
-        # Carrega sons
         self.start_sound = QSoundEffect()
         self.start_sound.setSource(QUrl.fromLocalFile("app/assets/start.wav"))
         self.start_sound.setVolume(0.8)
         self.stop_sound = QSoundEffect()
         self.stop_sound.setSource(QUrl.fromLocalFile("app/assets/stop.wav"))
         self.stop_sound.setVolume(0.8)
+        
+    def start_hotkey_capture_mode(self, input_field: QLineEdit):
+        """Prepara a aplicação para o modo de captura de atalho."""
+        # 1. Pausa o listener global para evitar o duplo disparo de eventos
+        if self.listener:
+            self.listener.set_paused(True)
+        
+        # 2. Inicia o processo de captura na página de configurações
+        self.page_settings.start_capture_hotkey(input_field)
 
+    def on_hotkey_changed(self, input_field: QLineEdit):
+        """
+        Este método é chamado quando um atalho é alterado com sucesso.
+        Ele agora inclui uma lógica para validar atalhos duplicados.
+        """
+        new_key_str = input_field.text()
+        hotkey_name = input_field.objectName().replace("input_", "")
+
+        # Se o campo estiver vazio (usuário pressionou ESC), apenas limpa o atalho.
+        if not new_key_str:
+            self.hotkeys[hotkey_name] = ""
+            if self.listener:
+                self.listener.update_hotkeys(self.hotkeys)
+                self.listener.set_paused(False)
+            bus.status_updated.emit(f"Atalho '{hotkey_name}' limpo.")
+            return
+
+        # --- LÓGICA DE VALIDAÇÃO DE DUPLICATAS ---
+        for name, value in self.hotkeys.items():
+            # Verifica se alguma OUTRA ação (name != hotkey_name) já usa a MESMA tecla (value == new_key_str)
+            if value == new_key_str and name != hotkey_name:
+                # CONFLITO ENCONTRADO!
+                original_key = self.hotkeys[hotkey_name]
+                input_field.setText(original_key) # Restaura o texto do campo para o valor antigo
+
+                # Mostra uma mensagem de aviso para o usuário
+                QMessageBox.warning(self, "Atalho Duplicado",
+                                    f"A tecla '{new_key_str}' já está sendo usada pela ação '{name}'.\n\n"
+                                    "A alteração foi desfeita.")
+
+                # É crucial despausar o listener, mesmo que a alteração tenha falhado.
+                if self.listener:
+                    self.listener.set_paused(False)
+                
+                # Para a execução do método aqui
+                return
+
+        if hotkey_name in self.hotkeys:
+            # 1. Atualiza o dicionário de atalhos da MainWindow
+            self.hotkeys[hotkey_name] = new_key_str
+            
+            # 2. Envia a lista de atalhos atualizada para o listener global
+            if self.listener:
+                self.listener.update_hotkeys(self.hotkeys)
+
+            bus.status_updated.emit(f"Atalho '{hotkey_name}' atualizado para '{new_key_str}'.")
+        else:
+            bus.status_updated.emit(f"Erro: atalho desconhecido '{hotkey_name}'.")
+
+        # Despausa o listener global agora que a captura (bem-sucedida) terminou
+        if self.listener:
+            self.listener.set_paused(False)
+
+    def event(self, event: QEvent) -> bool:
+            """
+            Manipula eventos de foco da janela de forma robusta.
+            """
+            if self.listener:
+                if event.type() == QEvent.Type.WindowActivate:
+                    # Se a janela ficou ativa e não é a página de macros...
+                    if self.pages.currentWidget() != self.page_macro:
+                        # ...e nós ainda não pausámos por este motivo, então pausamos agora.
+                        if not self.listener_paused_by_focus:
+                            self.listener.set_paused(True)
+                            self.listener_paused_by_focus = True
+                        bus.status_updated.emit("Pronto (Atalhos Pausados)")
+
+                elif event.type() == QEvent.Type.WindowDeactivate:
+                    # Se a janela ficou inativa...
+                    # ...e fomos nós que a pausámos, então reativamos os atalhos.
+                    if self.listener_paused_by_focus:
+                        self.listener.set_paused(False)
+                        self.listener_paused_by_focus = False
+                    bus.status_updated.emit("Pronto")
+
+            return super().event(event)
+    
     # --- NOVO SLOT CENTRAL PARA GERENCIAR ATALHOS ---
     def on_hotkey_pressed(self, hotkey_name: str):
         """Este slot é o novo centro de controle para todos os atalhos."""
         
         # Lógica para parar ações
         is_stop_key = hotkey_name in ("parar_tudo", "parar_gravacao")
-        if self.app_state == AppState.EXECUTING and (is_stop_key or "autoclicker" in hotkey_name or "macro" in hotkey_name):
+        if self.app_state == AppState.EXECUTING and (is_stop_key or "autoclicker" in hotkey_name or "macro" in hotkey_name or "bot" in hotkey_name):
             self.stop_all()
             return
         if (self.app_state == AppState.RECORDING_KEYBOARD or self.app_state == AppState.RECORDING_MOUSE) and is_stop_key:
@@ -287,8 +404,9 @@ class MainWindow(QMainWindow):
                 self.start_record_teclado()
             elif hotkey_name == "gravar_macro_mouse":
                 self.start_record_mouse()
+            elif hotkey_name == "iniciar_bot":
+                self.start_bot()
 
-    # --- NOVOS SLOTS PARA GRAVAÇÃO DE MACRO ---
     def on_key_pressed_for_macro(self, key):
         self.macro_keyboard_data
         if self.app_state != AppState.RECORDING_KEYBOARD:
@@ -302,6 +420,132 @@ class MainWindow(QMainWindow):
         self.ultimo_tempo = agora
         bus.macro_keyboard_updated.emit(self.macro_keyboard_data)
 
+    def start_bot(self):
+        """Inicia a execução do bot configurado pelo usuário."""
+        if self.app_state != AppState.IDLE:
+            return
+        if not self.bot_config.get("roi"):
+            QMessageBox.warning(self, "Erro", "A Área de Busca (ROI) não foi definida.")
+            return
+        if not self.bot_config.get("rules"):
+            QMessageBox.warning(self, "Erro", "Nenhuma regra foi criada para o bot.")
+            return
+
+        # Prepara a UI (sem a barra de progresso, pois o bot é contínuo)
+        self.stop_event.clear()
+        self.app_state = AppState.EXECUTING
+        self.play_start_sound()
+        bus.status_updated.emit("Bot em execução...")
+        self.show_overlay_message("Bot em Execução...")
+
+        # Instancia e inicia o nosso novo worker
+        self.worker_thread = BotWorker(
+            bot_config=self.bot_config,
+            stop_event=self.stop_event
+        )
+        self.worker_thread.start()
+
+    def handle_bot_remove_target(self):
+        """Remove o alvo selecionado da lista de alvos do bot."""
+        # Pega a linha do item atualmente selecionado na lista
+        current_row = self.page_bot.list_alvos.currentRow()
+
+        if current_row == -1: # -1 significa que nada está selecionado
+            bus.status_updated.emit("Nenhum alvo selecionado para remover.")
+            return
+
+        # Remove o alvo da nossa lista de dados de configuração
+        removed_target = self.bot_config["targets"].pop(current_row)
+        
+        # Atualiza a interface gráfica para refletir a remoção
+        self._update_bot_targets_list()
+        bus.status_updated.emit(f"Alvo '{removed_target['name']}' removido.")
+
+    def handle_bot_remove_rule(self):
+        """Remove a regra selecionada da lista de regras do bot."""
+        current_row = self.page_bot.list_regras.currentRow()
+
+        if current_row == -1:
+            bus.status_updated.emit("Nenhuma regra selecionada para remover.")
+            return
+            
+        # Remove a regra da nossa lista de dados de configuração
+        self.bot_config["rules"].pop(current_row)
+
+        # Atualiza a interface gráfica
+        self._update_bot_rules_list()
+        bus.status_updated.emit(f"Regra {current_row + 1} removida.")
+
+    def handle_bot_add_color_target(self):
+        """Inicia o modo de 'captura de cor'."""
+        if self.is_capturing_bot_color:
+            return
+
+        self.is_capturing_bot_color = True
+        bus.status_updated.emit("Capturando Cor: Clique no pixel desejado em qualquer lugar da tela.")
+        self.hide()
+
+    def on_bot_color_target_defined(self, x, y, color):
+        """
+        Chamado quando o usuário clica para capturar uma cor.
+        Pede um nome e adiciona o alvo de cor à configuração do bot.
+        """
+        target_name, ok = QInputDialog.getText(self, "Nome do Alvo de Cor", "Dê um nome único para esta cor (ex: 'Tile Preto', 'Vida Cheia'):")
+
+        if ok and target_name:
+            target_data = {
+                "name": target_name,
+                "type": "color",
+                "coords": (x, y), # Salva as coordenadas originais como referência
+                "color": color    # Salva a cor (R, G, B)
+            }
+            self.bot_config["targets"].append(target_data)
+            self._update_bot_targets_list() # Reutilizamos o método que atualiza a UI
+            bus.status_updated.emit(f"Alvo de cor '{target_name}' adicionado.")
+        else:
+            bus.status_updated.emit("Adição de alvo de cor cancelada.")
+
+    def handle_bot_add_rule(self):
+        """Abre o diálogo para o usuário criar uma nova regra."""
+        if not self.bot_config["targets"]:
+            QMessageBox.warning(self, "Nenhum Alvo", "Você precisa adicionar pelo menos um alvo antes de criar uma regra.")
+            return
+
+        # Cria e executa o diálogo, passando a lista de alvos existentes
+        dialog = RuleDialog(self.bot_config["targets"], self)
+        if dialog.exec() == QDialog.Accepted:
+            new_rule = dialog.get_rule_data()
+            if new_rule:
+                self.bot_config["rules"].append(new_rule)
+                self._update_bot_rules_list()
+                bus.status_updated.emit("Nova regra adicionada com sucesso.")
+
+    def _update_bot_rules_list(self):
+        """Atualiza a QListWidget com a lista de regras do bot_config."""
+        self.page_bot.list_regras.clear()
+        for rule in self.bot_config["rules"]:
+            target = rule['target_name']
+            action = rule['action_name']
+            value = rule['action_value']
+            exec_cfg = rule['execution']
+
+            action_str = f"-> {action}"
+            if value and action == "Pressionar Tecla":
+                # Constrói uma string legível para as teclas
+                keys_str = "".join(value['normal'])
+                special_str = ", ".join(value['special'])
+                full_keys_str = f"{keys_str}{', ' if keys_str and special_str else ''}{special_str}"
+                action_str += f" [{full_keys_str}]"
+            
+            # Constrói uma string para a configuração de execução
+            reps_str = "Infinito" if exec_cfg['reps'] == -1 else f"{exec_cfg['reps']}x"
+            delay_str = f"Delay: {exec_cfg['delay']}s"
+            if exec_cfg['random_delay']:
+                delay_str += f" ~ {exec_cfg['delay_max']}s"
+            
+            display_text = f"QUANDO '{target}' FAÇA {action_str} ({reps_str}, {delay_str})"
+            self.page_bot.list_regras.addItem(display_text)
+
     def on_key_released_for_macro(self, key):
         self.macro_keyboard_data
         if self.app_state != AppState.RECORDING_KEYBOARD:
@@ -314,9 +558,20 @@ class MainWindow(QMainWindow):
         bus.macro_keyboard_updated.emit(self.macro_keyboard_data)
     
     def on_mouse_event_for_macro(self, event_type, data):
-        self.macro_mouse_data
+
+        if event_type == "click" and self.is_capturing_bot_color:
+            x, y, button = data
+            color = ImageGrab.grab().getpixel((x, y))
+            
+            self.on_bot_color_target_defined(x, y, color)
+            
+            self.is_capturing_bot_color = False
+            self.showNormal()
+            self.activateWindow()
+            return 
         
-        # Captura de pixel/posição
+        global ultimo_tempo, macro_gravado_mouse
+        
         if event_type == "click":
             x, y, button = data
             if self.is_capturing_pixel:
@@ -366,6 +621,7 @@ class MainWindow(QMainWindow):
             "macro_teclado": "Key.f8", "macro_mouse": "Key.f10",
             "parar_tudo": "Key.f9", "gravar_macro_teclado": "Key.f1",
             "gravar_macro_mouse": "Key.f2", "parar_gravacao": "Key.f5",
+            "iniciar_bot": "Key.f11"
         }
         self.hotkeys.update(default_keys)
         for name, key_str in self.hotkeys.items():
@@ -410,6 +666,71 @@ class MainWindow(QMainWindow):
         self.tray_icon.activated.connect(self.on_tray_icon_activated)
         self.tray_icon.show()
 
+    def handle_bot_add_image_target(self):
+        """Inicia o processo de captura de imagem para um novo alvo do bot."""
+        # Cria uma pasta para os alvos do bot, se não existir
+        os.makedirs("app/bot_targets", exist_ok=True)
+            
+        bus.status_updated.emit("Novo Alvo: Desenhe um retângulo ao redor da imagem-alvo.")
+        self.hide()
+        self.capture_widget = CaptureWidget()
+        self.capture_widget.area_selecionada.connect(self.on_bot_image_target_defined)
+        QTimer.singleShot(50, self.capture_widget.show)
+
+    def on_bot_image_target_defined(self, rect_coords):
+        """
+        Chamado quando o usuário seleciona a área da imagem-alvo.
+        Pede um nome, salva a imagem e atualiza a configuração do bot.
+        """
+        x_log, y_log, w_log, h_log = rect_coords
+        if w_log == 0 or h_log == 0:
+            self.showNormal()
+            self.activateWindow()
+            bus.status_updated.emit("Captura de alvo cancelada.")
+            return
+
+        # Pede um nome para o alvo, que será usado nas regras
+        target_name, ok = QInputDialog.getText(self, "Nome do Alvo", "Dê um nome único para esta imagem (ex: 'Moeda de Ouro'):")
+        
+        if ok and target_name:
+            # Lógica de correção de DPI que já conhecemos
+            ratio = self.screen().devicePixelRatio()
+            x_phys, y_phys = int(x_log * ratio), int(y_log * ratio)
+            w_phys, h_phys = int(w_log * ratio), int(h_log * ratio)
+            
+            screenshot = ImageGrab.grab(bbox=(x_phys, y_phys, x_phys + w_phys, y_phys + h_phys))
+            
+            # Salva a imagem na pasta de alvos com um nome padronizado
+            safe_filename = target_name.replace(' ', '_').lower() + ".png"
+            image_path = os.path.join("app", "bot_targets", safe_filename)
+            screenshot.save(image_path)
+
+            # Cria o dicionário do alvo e o adiciona à configuração do bot
+            target_data = {
+                "name": target_name,
+                "type": "image",
+                "path": image_path
+            }
+            self.bot_config["targets"].append(target_data)
+            
+            # Atualiza a lista de alvos na UI para o usuário ver
+            self._update_bot_targets_list()
+            bus.status_updated.emit(f"Alvo '{target_name}' adicionado.")
+        else:
+            bus.status_updated.emit("Adição de alvo cancelada.")
+
+        self.showNormal()
+        self.activateWindow()
+
+    def _update_bot_targets_list(self):
+        """Atualiza a QListWidget com a lista de alvos do bot_config."""
+        self.page_bot.list_alvos.clear()
+        for target in self.bot_config["targets"]:
+            # Adiciona um ícone simples para diferenciar os tipos de alvo
+            icon = "📸" if target["type"] == "image" else "🎨"
+            display_text = f"{icon} {target['name']}"
+            self.page_bot.list_alvos.addItem(display_text)
+
     def quit_application(self):
         """Método seguro para fechar a aplicação."""
         self.listener.stop()
@@ -433,18 +754,35 @@ class MainWindow(QMainWindow):
             )
 
     def set_active_page(self, btn: QPushButton, page: QWidget):
-        for b in self.nav_buttons: b.setChecked(False)
-        btn.setChecked(True)
-        try:
-            effect = QGraphicsOpacityEffect(page)
-            page.setGraphicsEffect(effect)
-            self.pages.setCurrentWidget(page)
-            anim = QPropertyAnimation(effect, b"opacity", self)
-            anim.setDuration(220); anim.setStartValue(0.0); anim.setEndValue(1.0)
-            anim.finished.connect(lambda: page.setGraphicsEffect(None))
-            anim.start()
-        except Exception:
-            self.pages.setCurrentWidget(page)
+            # ... (a primeira parte do método, que trata da animação, continua igual)
+            for b in self.nav_buttons: b.setChecked(False)
+            btn.setChecked(True)
+            try:
+                effect = QGraphicsOpacityEffect(page)
+                page.setGraphicsEffect(effect)
+                self.pages.setCurrentWidget(page)
+                anim = QPropertyAnimation(effect, b"opacity", self)
+                anim.setDuration(220); anim.setStartValue(0.0); anim.setEndValue(1.0)
+                anim.finished.connect(lambda: page.setGraphicsEffect(None))
+                anim.start()
+            except Exception:
+                self.pages.setCurrentWidget(page)
+
+            # Lógica de pausa robusta ao trocar de página
+            if self.listener and self.isActiveWindow():
+                is_macro_page = (page == self.page_macro)
+
+                if is_macro_page and self.listener_paused_by_focus:
+                    # Se mudámos para a página de macros e os atalhos estavam pausados pelo foco, reativamo-los.
+                    self.listener.set_paused(False)
+                    self.listener_paused_by_focus = False
+                    bus.status_updated.emit("Pronto")
+                
+                elif not is_macro_page and not self.listener_paused_by_focus:
+                    # Se mudámos para outra página e os atalhos não estavam pausados, pausamo-los.
+                    self.listener.set_paused(True)
+                    self.listener_paused_by_focus = True
+                    bus.status_updated.emit("Pronto (Atalhos Pausados)")
         
     def start_cursor_tracker(self):
         self.mouse_pos_timer = QTimer(self)
@@ -455,6 +793,29 @@ class MainWindow(QMainWindow):
     def _update_mouse_pos(self):
         pos = QCursor.pos()
         self.page_macro.lbl_mouse_pos.setText(f"Posição atual: ({pos.x()}, {pos.y()})")
+
+    def handle_bot_roi_request(self):
+        """Inicia o processo de captura da área de busca para o bot."""
+        bus.status_updated.emit("Definindo ROI: Desenhe um retângulo na área de interesse.")
+        self.hide()
+        self.capture_widget = CaptureWidget()
+        # Conecta o sinal do widget de captura a um novo método "handler"
+        self.capture_widget.area_selecionada.connect(self.on_bot_roi_defined)
+        QTimer.singleShot(50, self.capture_widget.show)
+
+    def on_bot_roi_defined(self, rect_coords):
+        """Chamado quando o usuário termina de desenhar o retângulo do ROI."""
+        x, y, w, h = rect_coords
+        if w > 0 and h > 0:
+            self.bot_config["roi"] = (x, y, w, h)
+            # Atualiza o texto na página do bot para dar feedback ao usuário
+            self.page_bot.lbl_roi_coords.setText(f"Área definida: X={x}, Y={y}, W={w}, H={h}")
+            bus.status_updated.emit("Área de Busca (ROI) definida com sucesso.")
+        else:
+            bus.status_updated.emit("Definição de ROI cancelada.")
+        
+        self.showNormal()
+        self.activateWindow()
 
     def start_pixel_capture_mouse(self):
         self.is_capturing_pixel = True; self.hide(); bus.status_updated.emit("MODO DE CAPTURA (MOUSE): Clique no pixel desejado...")
