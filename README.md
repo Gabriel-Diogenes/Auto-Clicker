@@ -10,12 +10,12 @@ Um **auto clicker e gravador de macros** em Python com interface moderna usando 
 - Atalhos: `F6` → Iniciar, `F7` → Parar.
 
 ## Como usar
-1. Clique **⏺ Gravar Macro** para iniciar a gravação.  
-2. Pressione **⏹ Parar Gravação** ao finalizar.  
+1. Clique **Gravar Macro** para iniciar a gravação.  
+2. Pressione **Parar Gravação** ao finalizar.  
 3. Ajuste **velocidade** e **repetições**.  
-4. Clique **▶ Executar Macro** para rodar.  
-5. Use **⏹ Parar Macro** para interromper.  
-6. Salve e carregue macros com **💾 Salvar Macro** e **📂 Carregar Macro**.
+4. Clique **Executar Macro** para rodar.  
+5. Use **Parar Macro** para interromper.  
+6. Salve e carregue macros com **Salvar Macro** e **Carregar Macro**.
 
 ## Requisitos
 - Python 3.8+  
